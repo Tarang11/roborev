@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"uuid"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -94,7 +95,7 @@ func TestListJobsFindingCountsHTTP(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ClaimJob("daemon-finding-worker")
 	require.NoError(t, err)
-	require.NoError(t, db.CompleteJob(job.ID, "test", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, job.ID, "test", "prompt", "No issues found."))
 	structured := `{"schema_version":2,"summary":"review","verdict":"fail","findings":[{"severity":"critical","problem":"p","fix":"f","location":null},{"severity":"low","problem":"p","fix":"f","location":null}]}`
 	_, err = db.Exec("UPDATE reviews SET structured_output = ? WHERE job_id = ?", structured, job.ID)
 	require.NoError(t, err)
@@ -133,7 +134,7 @@ func TestListJobsFindingCountsHTTP(t *testing.T) {
 	require.Len(t, members, 1)
 	_, err = db.ClaimJob("daemon-panel-worker")
 	require.NoError(t, err)
-	require.NoError(t, db.CompleteJob(members[0].ID, "test", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, members[0].ID, "test", "prompt", "No issues found."))
 	_, err = db.Exec("UPDATE reviews SET structured_output = ? WHERE job_id = ?", structured, members[0].ID)
 	require.NoError(t, err)
 
@@ -261,12 +262,12 @@ func TestHandleListJobsClosedFilter(t *testing.T) {
 	commit, _ := db.GetOrCreateCommit(repo.ID, "aaa", "A", "S", time.Now())
 	job1, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "aaa", Branch: "main", Agent: "codex"})
 	db.ClaimJob("w")
-	db.CompleteJob(job1.ID, "codex", "", "output1")
+	testutil.CompleteReviewFixture(db, job1.ID, "codex", "", "output1")
 
 	commit2, _ := db.GetOrCreateCommit(repo.ID, "bbb", "A", "S2", time.Now())
 	job2, _ := db.EnqueueJob(storage.EnqueueOpts{RepoID: repo.ID, CommitID: commit2.ID, GitRef: "bbb", Branch: "main", Agent: "codex"})
 	db.ClaimJob("w")
-	db.CompleteJob(job2.ID, "codex", "", "output2")
+	testutil.CompleteReviewFixture(db, job2.ID, "codex", "", "output2")
 	db.MarkReviewClosedByJobID(job2.ID, true)
 
 	t.Run("closed=false", func(t *testing.T) {
@@ -791,7 +792,7 @@ func TestHandleEnqueueReusesPreviousBranchSessionWhenEnabled(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -900,7 +901,7 @@ func TestFindReusableSessionIDUsesDirtyBaseCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 	require.Equal(t, prevJob.ID, claimed.ID)
-	require.NoError(t, db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."))
 	_, err = db.Exec(`UPDATE review_jobs SET session_id = ? WHERE id = ?`, "session-dirty", prevJob.ID)
 	require.NoError(t, err)
 
@@ -962,7 +963,7 @@ func TestFindReusableSessionIDRejectsReusedBranchNameFromUnrelatedHistory(t *tes
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1032,7 +1033,7 @@ func TestFindReusableSessionIDRejectsCandidateThatIsTooOldOnBranch(t *testing.T)
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(prevJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, prevJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1108,7 +1109,7 @@ func TestFindReusableSessionIDFallsBackToOlderValidCandidate(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1144,7 +1145,7 @@ func TestFindReusableSessionIDFallsBackToOlderValidCandidate(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1215,7 +1216,7 @@ func TestFindReusableSessionIDUsesConfigurableLookback(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1252,7 +1253,7 @@ func TestFindReusableSessionIDUsesConfigurableLookback(t *testing.T) {
 				return false
 			}, "ClaimJob failed: %v", err)
 		}
-		if err := db.CompleteJob(invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
+		if err := testutil.CompleteReviewFixture(db, invalidJob.ID, "test", "prompt", "No issues found."); err != nil {
 			require.Condition(t, func() bool {
 				return false
 			}, "CompleteJob failed: %v", err)
@@ -1338,7 +1339,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1366,7 +1367,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(dirtyJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, dirtyJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1395,7 +1396,7 @@ func TestFindReusableSessionIDLookbackIgnoresUnusableRefs(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(malformedJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, malformedJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1464,7 +1465,7 @@ func TestFindReusableSessionIDAcceptsOpaqueStoredSessionID(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(validJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, validJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -1493,7 +1494,7 @@ func TestFindReusableSessionIDAcceptsOpaqueStoredSessionID(t *testing.T) {
 			return false
 		}, "ClaimJob failed: %v", err)
 	}
-	if err := db.CompleteJob(opaqueJob.ID, "test", "prompt", "No issues found."); err != nil {
+	if err := testutil.CompleteReviewFixture(db, opaqueJob.ID, "test", "prompt", "No issues found."); err != nil {
 		require.Condition(t, func() bool {
 			return false
 		}, "CompleteJob failed: %v", err)
@@ -2360,8 +2361,8 @@ func TestHandleListJobsJobTypeFilter(t *testing.T) {
 		reviewJob.ID, fixJob.ID,
 	)
 	require.NoError(t, err)
-	require.NoError(t, db.CompleteJob(reviewJob.ID, "test", "prompt", "review done"))
-	require.NoError(t, db.CompleteJob(fixJob.ID, "test", "prompt", "fix done"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, reviewJob.ID, "test", "prompt", "review done"))
+	require.NoError(t, testutil.CompleteReviewFixture(db, fixJob.ID, "test", "prompt", "fix done"))
 
 	t.Run("job_type=fix returns only fix jobs", func(t *testing.T) {
 		req := httptest.NewRequest(
@@ -3089,7 +3090,7 @@ func TestListJobsOmitPrompt(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ClaimJob("worker-omit")
 	require.NoError(t, err)
-	require.NoError(t, db.CompleteJob(doneJob.ID, "test", "a very large stored prompt", "No issues found."))
+	require.NoError(t, testutil.CompleteReviewFixture(db, doneJob.ID, "test", "a very large stored prompt", "No issues found."))
 	queuedJob, err := db.EnqueueJob(storage.EnqueueOpts{
 		RepoID:      repo.ID,
 		GitRef:      "queued-ref",
@@ -3319,4 +3320,25 @@ func TestHandleEnqueueDetachedHeadInfersBranch(t *testing.T) {
 		testutil.DecodeJSON(t, w, &job)
 		assert.Equal(t, "explicit-branch", job.Branch)
 	})
+}
+
+func TestHandleListJobsByIDWithArchivedReview(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+	_, jobs := seedRepoWithJobs(t, db, filepath.Join(tmpDir, "archived"), 1, "archive")
+	job := jobs[0]
+	_, archiveErr := db.Exec(`INSERT INTO legacy_reviews (job_id, agent, prompt, output, created_at, closed, uuid, migration_error) VALUES (?, 'test', 'prompt', ?, datetime('now'), 0, ?, 'AI conversion required')`, job.ID, "Legacy review", uuid.New())
+	require.NoError(t, archiveErr)
+	_, err := db.GetReviewByJobID(job.ID)
+	require.ErrorIs(t, err, storage.ErrLegacyReviewMigration)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/jobs?id=%d", job.ID), nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var response struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	testutil.DecodeJSON(t, w, &response)
+	require.Len(t, response.Jobs, 1)
+	assert.Equal(t, job.ID, response.Jobs[0].ID)
+	assert.NotContains(t, w.Body.String(), "Legacy review")
 }

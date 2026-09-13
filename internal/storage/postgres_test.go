@@ -677,7 +677,7 @@ func TestIntegration_NewDatabaseClearsSyncedAt(t *testing.T) {
 	_, err = sqliteDB.ClaimJob("worker")
 	require.NoError(t, err, "ClaimJob failed: %v")
 
-	err = sqliteDB.CompleteJob(job.ID, "test", "prompt", "output")
+	err = completeReviewFixture(sqliteDB, job.ID, "test", "prompt", "output")
 	require.NoError(t, err, "CompleteJob failed: %v")
 
 	// Mark everything as synced to simulate previous sync
@@ -1169,11 +1169,9 @@ func TestIntegration_BatchUpsertReviews(t *testing.T) {
 	require.NotNil(t, excludedFileCount)
 	assert.Equal(t, 0, *reviewedFileCount)
 	assert.Equal(t, 4, *excludedFileCount)
-	require.NoError(t, pool.pool.QueryRow(ctx,
-		`SELECT reviewed_file_count, excluded_file_count FROM reviews WHERE uuid = $1`, reviews[1].UUID,
-	).Scan(&reviewedFileCount, &excludedFileCount))
-	assert.Nil(t, reviewedFileCount)
-	assert.Nil(t, excludedFileCount)
+	var markdownRows int
+	require.NoError(t, pool.pool.QueryRow(ctx, `SELECT count(*) FROM reviews WHERE uuid = $1`, reviews[1].UUID).Scan(&markdownRows))
+	assert.Zero(t, markdownRows)
 
 	t.Run("empty batch is no-op", func(t *testing.T) {
 		success, err := pool.BatchUpsertReviews(ctx, []SyncableReview{})

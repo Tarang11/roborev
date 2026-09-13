@@ -49,8 +49,7 @@ func IsStructuredReviewAgent(a Agent) bool {
 
 // SupportsStructuredReview reports whether the registered agent with this
 // name (or alias) returns schema-constrained review output. Unknown names
-// report false so prompts built before an agent is resolved fall back to the
-// prose output format.
+// report false. Review output still must satisfy the JSON document model.
 func SupportsStructuredReview(name string) bool {
 	a, err := Get(name)
 	return err == nil && IsStructuredReviewAgent(a)

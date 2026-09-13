@@ -219,14 +219,11 @@ for auto-close, and `roborev fix` and the fix skills skip it because there is
 nothing to fix. `fix_min_severity` applies only to the findings of failing
 reviews.
 
-Agents that support schema-constrained output (Codex, Claude Code, Pi, and Grok)
-return their findings as structured data for every review type, so the verdict
-comes from the reported severities rather than from parsing prose. Other agents
-keep prose output, and roborev reads the severity labels in that prose the same
-way. A prose review without severity labels falls back to the agent's own pass
-or fail statement. Structured reviews also carry the agent's own verdict, shown
-in the output for context; an agent that reports it was unable to review the
-change fails the job instead of passing it.
+Every review agent must return the review JSON model. Agents with native JSON
+support use it; other agents receive the model in their prompt. Custom review
+types keep their existing native-schema agent requirement. Roborev validates the
+returned JSON and derives the result from finding severities. An agent that
+cannot review the change reports `unable_to_review` or an error.
 
 Set a default per repo in `.roborev.toml` or globally in
 `~/.roborev/config.toml`:
@@ -452,6 +449,54 @@ roborev fix                      # Fix open reviews on this branch
 Browse open reviews first with `roborev tui`, then fix them. See
 [Responding to Reviews](/docs/guides/responding-to-reviews/) for the full set of
 options.
+
+## Review storage and legacy migration
+
+New reviews, compact reviews, and synthesis reviews store their complete JSON
+review document. Markdown is generated for display and export. Findings below
+the configured severity threshold stay in the document, and synthesis documents
+retain their source references and reviewer labels.
+
+On database upgrade, roborev uses existing valid JSON as the authoritative
+review and archives the previous record. Records without valid JSON move to
+`legacy_reviews` with a `migration_error` explaining why they require
+conversion. They are excluded from normal review reads. Sync ignores
+Markdown-only review updates from older clients; it does not create new legacy
+records from them. Roborev does not guess missing severities, fixes, or
+synthesis sources, and does not launch an agent to convert historical records
+automatically.
+
+When unresolved records remain, roborev asks you to run an AI agent for the
+migration. Stop the daemon before importing results, and use the database path
+for the intended installation:
+
+```bash
+roborev legacy-reviews --db /path/to/reviews.db export > migration-input.json
+```
+
+Give that file to your agent. It contains the original records, the conversion
+errors, and the review and synthesis JSON schemas. Ask the agent to preserve all
+findings and to leave any record it cannot convert faithfully unresolved. Import
+each completed JSON document using the archive ID from the export:
+
+```bash
+roborev legacy-reviews --db /path/to/reviews.db import 1 < converted-review.json
+```
+
+An import validates the document before restoring the active review. The
+original record remains archived with a resolution timestamp. Restart the daemon
+after importing. Migration input contains private review data; keep it with the
+local database rather than adding it to a repository.
+
+The PostgreSQL mirror also archives legacy records and excludes them from active
+reviews. Its archive retains the original row as JSON in
+`legacy_reviews.record`. Use `--postgres-url` instead of `--db` to export and
+import these records. PostgreSQL archive IDs are UUIDs:
+
+```bash
+roborev legacy-reviews --postgres-url "$POSTGRES_URL" export > migration-input.json
+roborev legacy-reviews --postgres-url "$POSTGRES_URL" import <archive-uuid> < converted-review.json
+```
 
 ## See Also
 

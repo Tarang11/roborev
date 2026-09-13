@@ -579,6 +579,7 @@ func TestUpsertPulledReviewUsesStoredVerdict(t *testing.T) {
 	job := h.createPendingJob("stored-review-verdict")
 
 	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
+		StructuredOutput:   reviewFixtureJSON("No issues found."),
 		UUID:               testUUID("stored-review-verdict"),
 		JobUUID:            *job.UUID,
 		Agent:              "test",
@@ -595,81 +596,41 @@ func TestUpsertPulledReviewUsesStoredVerdict(t *testing.T) {
 	assert.Equal(t, VerdictFail, review.Verdict())
 }
 
-func TestUpsertPulledReviewDropsVerdictOnUnreadableOutput(t *testing.T) {
+func TestUpsertPulledReviewIgnoresMarkdown(t *testing.T) {
 	h := newSyncTestHelper(t)
-	job := h.createPendingJob("unreadable-pulled-verdict")
-
-	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
-		UUID:               testUUID("unreadable-pulled-verdict"),
-		JobUUID:            *job.UUID,
-		Agent:              "test",
-		Prompt:             "prompt",
-		Output:             "I am unable to read the diff file because it is ignored by configured ignore patterns.",
-		VerdictBool:        new(false),
-		UpdatedByMachineID: testUUID("unreadable-pulled-machine"),
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
-	}))
-
-	var verdict sql.NullInt64
-	require.NoError(t, h.db.QueryRow(
-		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
-	).Scan(&verdict))
-	assert.False(t, verdict.Valid, "a remote fail verdict on unreadable output must not be imported")
-}
-
-func TestUpsertPulledReviewClearsLegacyVerdictOnUnreadableUpdate(t *testing.T) {
-	h := newSyncTestHelper(t)
-	job := h.createPendingJob("unreadable-pulled-conflict")
-	const unreadable = "I am unable to read the diff file because it is ignored by configured ignore patterns."
-	first := time.Now().Add(-time.Minute)
-
-	// A legacy row stored the unreadable output with a fail verdict.
-	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
-		UUID: testUUID("unreadable-pulled-conflict"), JobUUID: *job.UUID,
-		Agent: "test", Prompt: "prompt", Output: "- High: placeholder finding",
-		VerdictBool: new(false), UpdatedByMachineID: testUUID("legacy-machine"),
-		CreatedAt: first, UpdatedAt: first,
-	}))
-	_, err := h.db.Exec(`UPDATE reviews SET output = ?, verdict_bool = 0 WHERE uuid = ?`,
-		unreadable, testUUID("unreadable-pulled-conflict"))
+	job := h.createPendingJob("legacy-pulled-review")
+	const prose = "I am unable to read the diff."
+	incoming := PulledReview{
+		UUID: testUUID("legacy-pulled-review"), JobUUID: *job.UUID,
+		Agent: "test", Prompt: "prompt", Output: prose,
+		VerdictBool: new(false), UpdatedByMachineID: testUUID("remote-machine"),
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	require.NoError(t, h.db.UpsertPulledReview(incoming))
+	_, err := h.db.GetReviewByJobID(job.ID)
+	require.ErrorIs(t, err, sql.ErrNoRows)
+	records, err := h.db.UnresolvedLegacyReviews()
 	require.NoError(t, err)
-
-	// A newer version of the same review arrives with the unreadable output.
-	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
-		UUID: testUUID("unreadable-pulled-conflict"), JobUUID: *job.UUID,
-		Agent: "test", Prompt: "prompt", Output: unreadable,
-		VerdictBool: new(false), UpdatedByMachineID: testUUID("legacy-machine"),
-		CreatedAt: first, UpdatedAt: time.Now(),
-	}))
-
-	var verdict sql.NullInt64
-	require.NoError(t, h.db.QueryRow(
-		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
-	).Scan(&verdict))
-	assert.False(t, verdict.Valid, "conflict update must clear a legacy verdict on unreadable output")
+	assert.Empty(t, records)
+	require.NoError(t, h.db.UpsertPulledReview(incoming))
+	records, err = h.db.UnresolvedLegacyReviews()
+	require.NoError(t, err)
+	assert.Empty(t, records)
 }
 
-func TestUpsertPulledReviewLeavesUnknownVerdictUnset(t *testing.T) {
+func TestUpsertPulledReviewDoesNotReplaceJSONWithMarkdown(t *testing.T) {
 	h := newSyncTestHelper(t)
-	job := h.createPendingJob("unknown-review-verdict")
-
+	job := h.createCompletedJob("converted-review")
+	review, err := h.db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
 	require.NoError(t, h.db.UpsertPulledReview(PulledReview{
-		UUID:               testUUID("unknown-review-verdict"),
-		JobUUID:            *job.UUID,
-		Agent:              "test",
-		Prompt:             "prompt",
-		Output:             "I am unable to read the diff file because it is ignored by configured ignore patterns.",
-		UpdatedByMachineID: testUUID("unknown-review-machine"),
-		CreatedAt:          time.Now(),
-		UpdatedAt:          time.Now(),
+		UUID: *review.UUID, JobUUID: *job.UUID, Agent: "test", Prompt: "prompt",
+		Output: "Old Markdown", CreatedAt: time.Now(), UpdatedAt: time.Now().Add(time.Hour),
+		UpdatedByMachineID: testUUID("remote-machine"),
 	}))
-
-	var verdict sql.NullInt64
-	require.NoError(t, h.db.QueryRow(
-		`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID,
-	).Scan(&verdict))
-	assert.False(t, verdict.Valid, "unknown verdict must remain NULL")
+	after, err := h.db.GetReviewByJobID(job.ID)
+	require.NoError(t, err)
+	assert.Equal(t, review.StructuredOutput, after.StructuredOutput)
 }
 
 // TestGetCommentsToSync_RequiresJobSynced verifies that responses are only
@@ -860,4 +821,15 @@ func TestUpsertPulledReviewLeavesTaskOutputUnrated(t *testing.T) {
 	var verdict sql.NullInt64
 	require.NoError(t, h.db.QueryRow(`SELECT verdict_bool FROM reviews WHERE job_id = ?`, job.ID).Scan(&verdict))
 	assert.False(t, verdict.Valid, "task output must stay unrated on pull, as it does locally")
+}
+
+func TestGetReviewsToSyncSkipsMarkdown(t *testing.T) {
+	h := newSyncTestHelper(t)
+	job := h.createCompletedJob("markdown-sync")
+	require.NoError(t, h.db.MarkJobSynced(job.ID))
+	_, err := h.db.Exec(`UPDATE reviews SET structured_output = NULL, output = 'Legacy Markdown' WHERE job_id = ?`, job.ID)
+	require.NoError(t, err)
+	reviews, err := h.db.GetReviewsToSync(h.machineID, 10)
+	require.NoError(t, err)
+	assert.Empty(t, reviews)
 }

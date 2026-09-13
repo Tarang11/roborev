@@ -1326,7 +1326,7 @@ func (s *Server) humaListJobs(
 				job.Verdict = review.Job.Verdict
 				job.FindingCounts = review.Job.FindingCounts
 			}
-		} else if !errors.Is(reviewErr, sql.ErrNoRows) {
+		} else if !errors.Is(reviewErr, sql.ErrNoRows) && !errors.Is(reviewErr, storage.ErrLegacyReviewMigration) {
 			return nil, huma.Error500InternalServerError(
 				fmt.Sprintf("load job review metadata: %v", reviewErr),
 			)
@@ -1613,6 +1613,10 @@ func (s *Server) humaGetReview(
 		return nil, huma.Error400BadRequest(
 			"job_id or sha parameter required",
 		)
+	}
+
+	if errors.Is(err, storage.ErrLegacyReviewMigration) {
+		return nil, huma.Error409Conflict(storage.LegacyReviewMigrationNotice)
 	}
 
 	if err != nil {

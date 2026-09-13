@@ -17,12 +17,12 @@ import (
 )
 
 // PostgreSQL schema version - increment when schema changes
-const pgSchemaVersion = 21
+const pgSchemaVersion = 22
 
 // pgSchemaName is the PostgreSQL schema used to isolate roborev tables
 const pgSchemaName = "roborev"
 
-//go:embed schemas/postgres_v21.sql
+//go:embed schemas/postgres_v22.sql
 var pgSchemaSQL string
 
 // pgSchemaStatements returns the individual DDL statements for schema creation.
@@ -516,7 +516,7 @@ func (p *PgPool) EnsureSchema(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return p.migrateLegacyReviews(ctx)
 }
 
 // GetDatabaseID returns the unique ID for this Postgres database.
@@ -815,6 +815,9 @@ func (p *PgPool) UpsertJob(ctx context.Context, j SyncableJob, pgRepoID int64, p
 
 // UpsertReview inserts or updates a review in PostgreSQL
 func (p *PgPool) UpsertReview(ctx context.Context, r SyncableReview) error {
+	if err := validateStructuredOutputForWrite(r.StructuredOutput); err != nil {
+		return err
+	}
 	verdictBool, noReview := syncedReviewVerdict(r)
 	_, err := p.pool.Exec(ctx, pgUpsertReviewSQL,
 		r.UUID, r.JobUUID, r.Agent, r.Prompt, r.Output, r.Closed,
@@ -828,16 +831,23 @@ func (p *PgPool) UpsertReview(ctx context.Context, r SyncableReview) error {
 // unrated even if a legacy verdict was stored before: output that is not a
 // review ($13), and free-form task or insights jobs, looked up by job type.
 const pgUpsertReviewSQL = `
-		INSERT INTO reviews (
+ WITH resolved AS (
+ UPDATE legacy_reviews SET resolved_at = clock_timestamp()
+ WHERE uuid = $1 AND $8::jsonb IS NOT NULL AND resolved_at IS NULL
+ )
+ INSERT INTO reviews (
 			uuid, job_uuid, agent, prompt, output, closed,
 			verdict_bool, structured_output, reviewed_file_count, excluded_file_count,
 			updated_by_machine_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6,
-			CASE WHEN EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = $2 AND j.job_type IN ('task', 'insights'))
+		) SELECT $1, $2, $3, $4, CASE WHEN $8::jsonb IS NOT NULL THEN '' ELSE $5 END, $6,
+ CASE WHEN EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = $2 AND j.job_type IN ('task', 'insights'))
 				THEN NULL ELSE $7::boolean END,
-			$8, $9, $10, $11, $12, clock_timestamp())
-		ON CONFLICT (uuid) DO UPDATE SET
+			$8, $9, $10, $11, $12, clock_timestamp()
+ WHERE $8::jsonb IS NOT NULL OR NOT EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = $2
+ AND j.job_type IN ('review','range','dirty','synthesis','compact'))
+ ON CONFLICT (uuid) DO UPDATE SET
 			closed = EXCLUDED.closed,
+ output = EXCLUDED.output,
 			verdict_bool = CASE
 				WHEN $13::boolean THEN NULL
 				WHEN EXISTS (SELECT 1 FROM review_jobs j WHERE j.uuid = EXCLUDED.job_uuid AND j.job_type IN ('task', 'insights')) THEN NULL
@@ -852,7 +862,7 @@ const pgUpsertReviewSQL = `
 // syncedReviewVerdict returns the verdict to store for a pushed review and
 // whether its output is not a review at all, mirroring the SQLite pull path.
 func syncedReviewVerdict(r SyncableReview) (*bool, bool) {
-	if ClassifyOutput(r.Output) != OutputReviewed {
+	if len(r.StructuredOutput) == 0 && ClassifyOutput(r.Output) != OutputReviewed {
 		return nil, true
 	}
 	return r.VerdictBool, false
@@ -1192,8 +1202,10 @@ func (p *PgPool) PullReviews(ctx context.Context, excludeMachineID uuid.UUID, kn
 			r.verdict_bool, r.structured_output, r.reviewed_file_count, r.excluded_file_count,
 			r.updated_by_machine_id, r.created_at, r.updated_at, r.id
 		FROM reviews r
+		JOIN review_jobs j ON j.uuid = r.job_uuid
 		WHERE (r.updated_by_machine_id IS NULL OR r.updated_by_machine_id != $1)
 		AND r.job_uuid = ANY($2)
+		AND (r.structured_output IS NOT NULL OR j.job_type NOT IN ('review','range','dirty','synthesis','compact'))
 		AND (r.updated_at > $3 OR (r.updated_at = $3 AND r.id > $4))
 		ORDER BY r.updated_at, r.id
 		LIMIT $5
@@ -1352,6 +1364,11 @@ func (p *PgPool) BatchUpsertReviews(ctx context.Context, reviews []SyncableRevie
 		return nil, nil
 	}
 
+	for _, r := range reviews {
+		if err := validateStructuredOutputForWrite(r.StructuredOutput); err != nil {
+			return nil, err
+		}
+	}
 	batch := &pgx.Batch{}
 	for _, r := range reviews {
 		verdictBool, noReview := syncedReviewVerdict(r)
