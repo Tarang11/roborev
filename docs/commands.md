@@ -1036,6 +1036,21 @@ roborev skills update            # Update installed skills
 
 See: [Agent Skills](/docs/guides/agent-skills/)
 
+## MCP Server
+
+```bash
+roborev mcp serve                # Serve read-only review tools over stdio
+roborev mcp status               # List daemons serving the HTTP MCP endpoint
+roborev mcp status --json        # Same as a JSON listener array
+```
+
+Exposes roborev review data to MCP clients. The stdio server reads from the
+daemon over its HTTP API and starts the daemon when needed. Set
+`[mcp] enabled = true` to also serve streamable HTTP at `/mcp` on the daemon
+listener.
+
+See: [MCP Server](/docs/integrations/mcp/)
+
 ## Sync & Streaming
 
 ```bash
