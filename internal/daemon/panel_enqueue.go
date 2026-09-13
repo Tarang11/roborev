@@ -638,9 +638,12 @@ func (s *Server) maybeDispatchPanelAutoDesign(
 	}
 }
 
+// panelHasDesignMember reports whether the panel already provides design
+// coverage. Only voting members count: a non-voting design trial never feeds
+// synthesis, so it must not suppress the automatic design review.
 func panelHasDesignMember(members []config.ResolvedMember) bool {
 	for _, m := range members {
-		if strings.EqualFold(strings.TrimSpace(m.ReviewType), "design") {
+		if !m.NonVoting && strings.EqualFold(strings.TrimSpace(m.ReviewType), "design") {
 			return true
 		}
 	}
@@ -669,6 +672,7 @@ func panelMemberOpts(
 		o.PanelRunUUID, o.PanelRole = &runUUID, storage.PanelRoleMember
 		o.PanelName, o.PanelMemberName, o.PanelMemberIndex = panelName, m.Name, m.Index
 		o.PanelMemberConfigJSON = string(cfgJSON)
+		o.NonVoting = m.NonVoting
 		out[i] = o
 	}
 	return out, nil

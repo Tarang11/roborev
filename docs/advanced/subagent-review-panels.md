@@ -171,6 +171,7 @@ timeout = "3m"
 | `review_type` | string | `default`, `security`, `design`, or `lookahead`. `review` and `general` are accepted as aliases for `default`. |
 | `instructions` | string | Additional instructions appended only to this member prompt. |
 | `allow_failure` | bool | When true, a failed or canceled member does not make an otherwise successful panel fail. |
+| `non_voting` | bool | When true, the member runs and stores its review but is excluded from synthesis and the panel verdict. |
 | `timeout` | duration string | Per-member job timeout such as `90s`, `3m`, or `1h`. Empty uses repo/global `job_timeout_minutes`. |
 
 The member workflow is chosen from `review_type`: `default` uses review workflow
@@ -188,6 +189,36 @@ that is useful when available but should not block the panel, such as a reviewer
 running on flaky external infrastructure. If every required reviewer also fails
 and no member produces review output, the panel still records a
 failed/unavailable review instead of passing.
+
+`non_voting` is how you trial a new agent or model without letting it shape the
+authoritative result. A non-voting member runs with the same prompt as every
+other member and its review is stored on its own job, so you can read it in the
+TUI, `roborev show`, and the daemon API. It is never fed to the synthesis agent,
+never counted toward the panel verdict or CI commit status, and never rendered
+in the PR comment body; the comment footer only counts it separately. Its stored
+review starts with a banner noting that it was advisory, and member listings
+label it `(non-voting)` in the TUI, the web UI, and `roborev show`. The flag is
+stored on the job and syncs between machines, so the banner and labels render
+everywhere.
+
+Synthesis does not wait for non-voting members. Once every voting member has
+finished, the synthesized review, the PR comment, and the CI commit status
+proceed while a slow trial agent is still running; its review appears on its own
+job when it completes. A non-voting design member does not count as design
+coverage, so the automatic design review still runs when the change warrants
+one. A panel must keep at least one voting member; a panel whose members are all
+non-voting is rejected at config validation.
+
+```toml
+[review.subagents.trial]
+agent = "gemini"
+model = "gemini-3-pro"
+review_type = "default"
+non_voting = true
+
+[review.panels.branch_final]
+members = ["bug", "security", "trial"]
+```
 
 ### Panels
 

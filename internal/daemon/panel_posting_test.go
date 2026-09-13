@@ -102,6 +102,7 @@ func (h *ciPollerHarness) seedCIPanelRun(
 			RepoID: h.Repo.ID, GitRef: gitRef, Agent: s.Agent, ReviewType: s.ReviewType,
 			JobType: storage.JobTypeReview, PanelName: "ci", PanelMemberName: s.Agent,
 			PanelMemberIndex: i, PanelMemberConfigJSON: s.PanelMemberConfigJSON,
+			NonVoting: s.NonVoting,
 		})
 	}
 	synthesis := storage.EnqueueOpts{
@@ -915,6 +916,35 @@ func TestPanelWrapperNoDoubleHeader(t *testing.T) {
 		assert.NotContains(t, body, "1 failed")
 		assert.NotContains(t, body, "1 canceled")
 		assert.NotContains(t, body, "gemini/security")
+	})
+}
+
+// TestPanelNonVotingMemberExcludedFromComment verifies a non_voting member is
+// kept out of the posted review body and the reviewer footer.
+func TestPanelNonVotingMemberExcludedFromComment(t *testing.T) {
+	t.Run("raw fallback omits the non-voting review", func(t *testing.T) {
+		assert := assert.New(t)
+		h := newCIPollerHarness(t, "https://github.com/acme/api.git")
+		comments := h.CaptureComments()
+		statuses := h.CaptureCommitStatuses()
+
+		const headSHA = "3333333ccccccc"
+		_, synth, _ := h.seedCIPanelRun(t, "acme/api", 12, headSHA, "1111111aaaaaa.."+headSHA,
+			[]jobSpec{
+				{Agent: "codex", ReviewType: "review", Status: "done", Output: "Voting finding"},
+				{Agent: "trial", ReviewType: "review", Status: "done", Output: "Observer finding", NonVoting: true},
+			})
+		h.markJobFailed(t, synth.ID, "synthesis crashed")
+
+		h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
+
+		require.Len(t, *comments, 1)
+		body := (*comments)[0].Body
+		assert.Contains(body, "Voting finding")
+		assert.NotContains(body, "Observer finding")
+		assert.NotContains(body, "trial")
+		require.Len(t, *statuses, 1)
+		assert.Equal("success", (*statuses)[0].State)
 	})
 }
 

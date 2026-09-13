@@ -103,6 +103,7 @@ type EnqueueOpts struct {
 	PanelMemberName       string                     // Subagent name for a member
 	PanelMemberIndex      int                        // Stable order of a member within the run
 	PanelMemberConfigJSON string                     // Resolved member spec JSON (reproducibility)
+	NonVoting             bool                       // Advisory member: stored and labeled, excluded from synthesis and verdict
 	ClaimBlocked          bool                       // Local-only gate: ClaimJob must not claim while set
 	Experiment            *ExperimentAssignmentInput // Standalone assignment, or panel assignment when set on synthesis
 }
@@ -285,6 +286,10 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 	if opts.ClaimBlocked {
 		claimBlockedInt = 1
 	}
+	nonVotingInt := 0
+	if opts.NonVoting {
+		nonVotingInt = 1
+	}
 	sessionResumedInt := 0
 	if opts.SessionID != "" {
 		sessionResumedInt = 1
@@ -294,8 +299,8 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, ci_base_branch, session_id, session_resumed, resume_source_job_uuid, agent, model, provider, requested_model, requested_provider, reasoning,
 			status, job_type, review_type, patch_id, diff_content, dirty_files, prompt, agentic, prompt_prebuilt, output_prefix,
 			parent_job_id, uuid, source_machine_id, updated_at, worktree_path, min_severity, backup_agent, backup_model,
-			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, claim_blocked, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			panel_run_uuid, panel_role, panel_name, panel_member_name, panel_member_index, panel_member_config_json, non_voting, claim_blocked, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch), nullString(opts.CIBaseBranch), nullString(opts.SessionID),
 		sessionResumedInt, opts.ResumeSourceJobUUID,
 		opts.Agent, nullString(opts.Model), nullString(opts.Provider), nullString(opts.RequestedModel), nullString(opts.RequestedProvider), reasoning,
@@ -304,7 +309,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		nullString(opts.OutputPrefix), parentJobIDParam,
 		uid, machineID, nowStr, opts.WorktreePath, normalizeMinSeverityForWrite(opts.MinSeverity), opts.BackupAgent, opts.BackupModel,
 		opts.PanelRunUUID, nullString(opts.PanelRole), nullString(opts.PanelName),
-		nullString(opts.PanelMemberName), opts.PanelMemberIndex, nullString(opts.PanelMemberConfigJSON), claimBlockedInt, nullString(opts.Source))
+		nullString(opts.PanelMemberName), opts.PanelMemberIndex, nullString(opts.PanelMemberConfigJSON), nonVotingInt, claimBlockedInt, nullString(opts.Source))
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +352,7 @@ func (db *DB) insertJobTx(ctx context.Context, exec execer, opts EnqueueOpts, ui
 		PanelMemberName:       opts.PanelMemberName,
 		PanelMemberIndex:      opts.PanelMemberIndex,
 		PanelMemberConfigJSON: opts.PanelMemberConfigJSON,
+		NonVoting:             opts.NonVoting,
 		ClaimBlocked:          opts.ClaimBlocked,
 		Source:                opts.Source,
 	}
@@ -643,20 +649,14 @@ func (db *DB) claimJobAttempt(
 	var job ReviewJob
 	var fields reviewJobScanFields
 	err = conn.QueryRowContext(ctx, `
-		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.model, j.provider, j.requested_model, j.requested_provider, j.reasoning, j.status, j.enqueued_at,
-		       r.root_path, r.name, c.subject, j.diff_content, j.dirty_files, j.prompt, COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0), j.job_type, j.review_type,
-		       j.output_prefix, j.patch_id, j.parent_job_id, COALESCE(j.worktree_path, ''), j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0), COALESCE(j.source, ''), j.retry_count, j.uuid
+		SELECT `+jobSelectColumns(jobTextAll)+`
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.worker_id = ? AND j.status = 'running'
 		ORDER BY j.started_at DESC
 		LIMIT 1
-	`, workerID).Scan(&job.ID, &job.RepoID, &fields.CommitID, &job.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &job.Agent, &fields.Model, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &job.Reasoning, &job.Status, &fields.EnqueuedAt,
-		&job.RepoPath, &job.RepoName, &fields.CommitSubject, &fields.DiffContent, &fields.DirtyFiles, &fields.Prompt, &fields.Agentic, &fields.PromptPrebuilt, &fields.JobType, &fields.ReviewType,
-		&fields.OutputPrefix, &fields.PatchID, &fields.ParentJobID, &fields.WorktreePath, &fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
-		&fields.PanelRunUUID, &fields.PanelRole, &fields.PanelName, &fields.PanelMemberName, &fields.PanelMemberIndex, &fields.PanelMemberConfig, &fields.ClaimBlocked, &fields.Source, &job.RetryCount, &fields.UUID)
+	`, workerID).Scan(jobScanDestinations(&job, &fields)...)
 	if err != nil {
 		return nil, err
 	}
@@ -1987,18 +1987,9 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 	// verdicts come from JSON at write time; only free-form job types may
 	// still need their output here. Keep the large text expressions lazy.
 	query := `
-		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, ` + promptExpr + `, j.retry_count, ` + diffContentExpr + `,
-		       COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0), r.root_path, r.name, c.subject, rv.closed,
-		       CASE WHEN rv.verdict_bool IS NULL THEN rv.output ELSE '' END,
-		       rv.verdict_bool,
-		       CASE WHEN rv.verdict_bool IS NOT NULL THEN 1 ELSE COALESCE(rv.output != '', 0) END,
-		       ` + structuredOutputExpr + `,
-		       j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
-		       j.parent_job_id, j.provider, j.requested_model, j.requested_provider, j.token_usage, COALESCE(j.worktree_path, ''),
-		       j.command_line, j.dirty_files, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0)
+		SELECT ` + jobWithReviewSelectColumns(
+		jobTextColumns{Prompt: promptExpr, Diff: diffContentExpr, Patch: "NULL"}, structuredOutputExpr,
+	) + `
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
@@ -2028,29 +2019,12 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 	var jobs []ReviewJob
 	for rows.Next() {
 		var j ReviewJob
-		var output sql.NullString
-		var verdictBool sql.NullInt64
-		var hasOutput bool
-		var structuredOutput sql.NullString
 		var fields reviewJobScanFields
-
-		err := rows.Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-			&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount, &fields.DiffContent,
-			&fields.Agentic, &fields.PromptPrebuilt, &j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Closed, &output,
-			&verdictBool, &hasOutput, &structuredOutput, &fields.SourceMachineID, &fields.UUID, &fields.Model, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
-			&fields.ParentJobID, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.TokenUsage, &fields.WorktreePath,
-			&fields.CommandLine, &fields.DirtyFiles, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
-			&fields.SkipReason, &fields.Source,
-			&fields.PanelRunUUID, &fields.PanelRole, &fields.PanelName, &fields.PanelMemberName, &fields.PanelMemberIndex, &fields.PanelMemberConfig, &fields.ClaimBlocked)
-		if err != nil {
+		var review jobReviewScanFields
+		if err := rows.Scan(jobWithReviewScanDestinations(&j, &fields, &review)...); err != nil {
 			return nil, err
 		}
-		applyReviewJobScan(&j, fields)
-		applyJobVerdict(&j, verdictBool, output.String, hasOutput)
-		if options.includeFindings {
-			applyJobFindingCounts(&j, structuredOutput)
-		}
-
+		applyJobWithReviewScan(&j, fields, review, options.includeFindings)
 		jobs = append(jobs, j)
 	}
 
@@ -2114,22 +2088,12 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	var j ReviewJob
 	var fields reviewJobScanFields
 	err := db.QueryRow(`
-		SELECT j.id, j.uuid, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count, COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0),
-		       r.root_path, r.name, c.subject, j.model, j.provider, j.requested_model, j.requested_provider, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
-		       j.parent_job_id, j.patch, j.token_usage, j.dirty_files, COALESCE(j.worktree_path, ''), j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0)
+		SELECT `+jobSelectColumns(jobTextAll)+`
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.id = ?
-	`, id).Scan(&j.ID, &fields.UUID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount, &fields.Agentic, &fields.PromptPrebuilt,
-		&j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Model, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
-		&fields.ParentJobID, &fields.Patch, &fields.TokenUsage, &fields.DirtyFiles, &fields.WorktreePath, &fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
-		&fields.SkipReason, &fields.Source,
-		&fields.PanelRunUUID, &fields.PanelRole, &fields.PanelName, &fields.PanelMemberName, &fields.PanelMemberIndex, &fields.PanelMemberConfig, &fields.ClaimBlocked)
+	`, id).Scan(jobScanDestinations(&j, &fields)...)
 	if err != nil {
 		return nil, err
 	}
@@ -2608,6 +2572,7 @@ func (db *DB) MaybeReleasePanelSynthesis(panelRunUUID uuid.UUID) error {
 		       SELECT 1 FROM review_jobs m
 		        WHERE m.panel_run_uuid = review_jobs.panel_run_uuid
 		          AND m.panel_role = 'member'
+		          AND COALESCE(m.non_voting, 0) = 0
 		          AND m.status NOT IN ('done','failed','canceled','skipped','applied','rebased')
 		   )
 	`, now, panelRunUUID)
@@ -2630,6 +2595,7 @@ func (db *DB) ListStuckPanelRuns() ([]uuid.UUID, error) {
 		      SELECT 1 FROM review_jobs m
 		       WHERE m.panel_run_uuid = s.panel_run_uuid
 		         AND m.panel_role = 'member'
+		         AND COALESCE(m.non_voting, 0) = 0
 		         AND m.status NOT IN ('done','failed','canceled','skipped','applied','rebased')
 		  )
 	`)
@@ -2658,14 +2624,7 @@ func (db *DB) GetPanelMembers(panelRunUUID uuid.UUID) ([]ReviewJob, error) {
 		return nil, nil
 	}
 	rows, err := db.Query(`
-		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count,
-		       COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0), r.root_path, r.name, c.subject, rv.closed, rv.output,
-		       rv.verdict_bool, j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
-		       j.parent_job_id, j.provider, j.requested_model, j.requested_provider, j.token_usage, COALESCE(j.worktree_path, ''),
-		       j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0)
+		SELECT `+jobWithReviewSelectColumns(jobTextPrompt, "''")+`
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
@@ -2681,24 +2640,12 @@ func (db *DB) GetPanelMembers(panelRunUUID uuid.UUID) ([]ReviewJob, error) {
 	var jobs []ReviewJob
 	for rows.Next() {
 		var j ReviewJob
-		var output sql.NullString
-		var verdictBool sql.NullInt64
 		var fields reviewJobScanFields
-		err := rows.Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-			&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount,
-			&fields.Agentic, &fields.PromptPrebuilt, &j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Closed, &output,
-			&verdictBool, &fields.SourceMachineID, &fields.UUID, &fields.Model, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
-			&fields.ParentJobID, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.TokenUsage, &fields.WorktreePath,
-			&fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
-			&fields.SkipReason, &fields.Source,
-			&fields.PanelRunUUID, &fields.PanelRole, &fields.PanelName, &fields.PanelMemberName, &fields.PanelMemberIndex, &fields.PanelMemberConfig, &fields.ClaimBlocked)
-		if err != nil {
+		var review jobReviewScanFields
+		if err := rows.Scan(jobWithReviewScanDestinations(&j, &fields, &review)...); err != nil {
 			return nil, fmt.Errorf("scan panel member: %w", err)
 		}
-		applyReviewJobScan(&j, fields)
-		if output.Valid {
-			applyJobVerdict(&j, verdictBool, output.String, output.String != "" || verdictBool.Valid)
-		}
+		applyJobWithReviewScan(&j, fields, review, false)
 		jobs = append(jobs, j)
 	}
 	if err := rows.Err(); err != nil {
@@ -2719,51 +2666,34 @@ func (db *DB) GetSynthesisJob(panelRunUUID uuid.UUID) (*ReviewJob, error) {
 		return nil, nil
 	}
 	var j ReviewJob
-	var output sql.NullString
-	var verdictBool sql.NullInt64
 	var fields reviewJobScanFields
+	var review jobReviewScanFields
 	err := db.QueryRow(`
-		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.ci_base_branch, j.session_id, j.resume_source_job_uuid, j.agent, j.reasoning, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count,
-		       COALESCE(j.agentic, 0), COALESCE(j.prompt_prebuilt, 0), r.root_path, r.name, c.subject, rv.closed, rv.output,
-		       rv.verdict_bool, j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id, COALESCE(j.output_prefix, ''),
-		       j.parent_job_id, j.provider, j.requested_model, j.requested_provider, j.token_usage, COALESCE(j.worktree_path, ''),
-		       j.command_line, COALESCE(j.min_severity, ''), COALESCE(j.backup_agent, ''), COALESCE(j.backup_model, ''),
-		       COALESCE(j.skip_reason, ''), COALESCE(j.source, ''),
-		       NULLIF(j.panel_run_uuid, ''), COALESCE(j.panel_role, ''), COALESCE(j.panel_name, ''), COALESCE(j.panel_member_name, ''), j.panel_member_index, COALESCE(j.panel_member_config_json, ''), COALESCE(j.claim_blocked, 0)
+		SELECT `+jobWithReviewSelectColumns(jobTextPrompt, "''")+`
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		LEFT JOIN reviews rv ON rv.job_id = j.id
 		WHERE j.panel_run_uuid = ? AND j.panel_role = 'synthesis'
 		LIMIT 1
-	`, panelRunUUID).Scan(&j.ID, &j.RepoID, &fields.CommitID, &j.GitRef, &fields.Branch, &fields.CIBaseBranch, &fields.SessionID, &fields.ResumeSourceUUID, &j.Agent, &j.Reasoning, &j.Status, &fields.EnqueuedAt,
-		&fields.StartedAt, &fields.FinishedAt, &fields.WorkerID, &fields.Error, &fields.Prompt, &j.RetryCount,
-		&fields.Agentic, &fields.PromptPrebuilt, &j.RepoPath, &j.RepoName, &fields.CommitSubject, &fields.Closed, &output,
-		&verdictBool, &fields.SourceMachineID, &fields.UUID, &fields.Model, &fields.JobType, &fields.ReviewType, &fields.PatchID, &fields.OutputPrefix,
-		&fields.ParentJobID, &fields.Provider, &fields.RequestedModel, &fields.RequestedProvider, &fields.TokenUsage, &fields.WorktreePath,
-		&fields.CommandLine, &fields.MinSeverity, &fields.BackupAgent, &fields.BackupModel,
-		&fields.SkipReason, &fields.Source,
-		&fields.PanelRunUUID, &fields.PanelRole, &fields.PanelName, &fields.PanelMemberName, &fields.PanelMemberIndex, &fields.PanelMemberConfig, &fields.ClaimBlocked)
+	`, panelRunUUID).Scan(jobWithReviewScanDestinations(&j, &fields, &review)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query panel synthesis: %w", err)
 	}
-	applyReviewJobScan(&j, fields)
-	if output.Valid {
-		applyJobVerdict(&j, verdictBool, output.String, output.String != "" || verdictBool.Valid)
-	}
+	applyJobWithReviewScan(&j, fields, review, false)
 	if err := db.attachExperimentAssignments(&j); err != nil {
 		return nil, err
 	}
 	return &j, nil
 }
 
-// GetPanelMemberReviews returns one BatchReviewResult per member of a panel
-// run, joined to its review output, ordered by panel_member_index. The
-// synthesis row is excluded.
+// GetPanelMemberReviews returns one BatchReviewResult per voting member of a
+// panel run, joined to its review output, ordered by panel_member_index. The
+// synthesis row and non-voting members are excluded, so synthesis, the PR
+// comment, and the commit status never see a non-voting review.
 func (db *DB) GetPanelMemberReviews(panelRunUUID uuid.UUID) ([]BatchReviewResult, error) {
 	if panelRunUUID == uuid.Nil() {
 		return nil, nil
@@ -2774,7 +2704,7 @@ func (db *DB) GetPanelMemberReviews(panelRunUUID uuid.UUID) ([]BatchReviewResult
 		       COALESCE(j.started_at, ''), COALESCE(j.finished_at, ''), COALESCE(j.token_usage, '')
 		FROM review_jobs j
 		LEFT JOIN reviews rv ON rv.job_id = j.id
-		WHERE j.panel_run_uuid = ? AND j.panel_role = 'member'
+		WHERE j.panel_run_uuid = ? AND j.panel_role = 'member' AND COALESCE(j.non_voting, 0) = 0
 		ORDER BY j.panel_member_index, j.id`, panelRunUUID)
 	if err != nil {
 		return nil, fmt.Errorf("query panel member reviews: %w", err)

@@ -1193,8 +1193,11 @@ func (p *CIPoller) maybeAppendDesignMember(
 	repo *storage.Repo, repoCfg *config.RepoConfig, cfg *config.Config,
 	mergeBase, headSHA string,
 ) []config.ResolvedMember {
+	// Only a voting design member provides design coverage; a non-voting
+	// design trial is dropped before synthesis and must not suppress the
+	// automatic design review.
 	for _, m := range members {
-		if m.ReviewType == config.ReviewTypeDesign {
+		if m.ReviewType == config.ReviewTypeDesign && !m.NonVoting {
 			return members
 		}
 	}
@@ -1381,6 +1384,7 @@ func (p *CIPoller) buildPanelOpts(ctx context.Context, in buildPanelOptsInput) (
 			PanelMemberName:       m.Name,
 			PanelMemberIndex:      i,
 			PanelMemberConfigJSON: string(cfgJSON),
+			NonVoting:             m.NonVoting,
 		})
 	}
 
