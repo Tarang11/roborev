@@ -22,8 +22,8 @@ import (
 var errSynthesisCanceled = errors.New("synthesis canceled")
 
 // processSynthesisJob executes a panel synthesis job against the run's member
-// reviews. It picks one of three branches: all members failed -> durable fail
-// review (no agent); exactly one member succeeded -> passthrough that member's
+// reviews. It picks one of three branches: all members failed -> failed job
+// without a review (no agent); exactly one member succeeded -> passthrough that member's
 // output and effective threshold; two or more
 // succeeded -> a single verify+dedupe agent call.
 func (wp *WorkerPool) processSynthesisJob(
@@ -55,17 +55,11 @@ func (wp *WorkerPool) processSynthesisJob(
 
 	switch len(succeeded) {
 	case 0:
-		if errMsg, ok := allAvailabilitySkippedFailure(results); ok {
-			wp.failSynthesisWithoutReviewContext(ctx, workerID, job, errMsg)
-			return
+		errMsg, ok := allAvailabilitySkippedFailure(results)
+		if !ok {
+			errMsg = "all review agents failed or produced no usable output"
 		}
-		// Every member failed — emit a durable fail review with no agent call.
-		// The comment renders the head SHA (FormatAllFailedComment short-SHAs its
-		// arg), so pass the head side of the frozen mergeBase..headSHA range.
-		wp.completeSynthesisDocument(workerID, job, structuredreview.Document{
-			SchemaVersion: structuredreview.SchemaVersion, Summary: fmt.Sprintf("All review agents failed for %s; no review could be produced.", headOf(job.GitRef)),
-			Verdict: structuredreview.VerdictUnableToReview, Findings: []structuredreview.Finding{},
-		})
+		wp.failSynthesisWithoutReviewContext(ctx, workerID, job, errMsg)
 	case 1:
 		// Exactly one member produced output — pass it through verbatim and
 		// label the review with that member's agent. Its verdict already
@@ -237,14 +231,20 @@ func (wp *WorkerPool) failSynthesisWithoutReviewLocked(
 	workerID string, job *storage.ReviewJob, errorMsg string,
 ) {
 	if updated, err := wp.db.FailJob(job.ID, workerID, errorMsg); err != nil {
-		log.Printf("[%s] Error failing skipped synthesis job %d: %v", workerID, job.ID, err)
+		log.Printf("[%s] Error failing synthesis job %d: %v", workerID, job.ID, err)
 	} else if updated {
-		log.Printf("[%s] Synthesis job %d skipped because all panel members were unavailable",
-			workerID, job.ID)
-		wp.broadcastFailed(job, job.Agent, errorMsg)
+		log.Printf("[%s] Synthesis job %d failed: %s",
+			workerID, job.ID, errorMsg)
+		// No synthesis agent ran. Keep CI and streaming subscribers informed
+		// without attributing another agent failure or repeating member alerts.
+		event := eventForJob("review.failed", job, job.ID)
+		event.Agent = ""
+		event.Error = errorMsg
+		event.SuppressHooks = true
+		wp.broadcaster.Broadcast(event)
 		if wp.errorLog != nil {
 			wp.errorLog.LogError("worker",
-				fmt.Sprintf("synthesis job %d skipped: %s", job.ID, errorMsg),
+				fmt.Sprintf("synthesis job %d failed: %s", job.ID, errorMsg),
 				job.ID)
 		}
 		wp.logJobFailed(job.ID, workerID, job.Agent, errorMsg)

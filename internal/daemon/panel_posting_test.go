@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	googlegithub "github.com/google/go-github/v90/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/internal/config"
 	"go.kenn.io/roborev/internal/git"
 	reviewpkg "go.kenn.io/roborev/internal/review"
 	"go.kenn.io/roborev/internal/storage"
@@ -75,7 +78,7 @@ func TestPanelCommentLookupErrorDoesNotPostFallback(t *testing.T) {
 	require.NoError(t, err)
 	_, err = h.DB.GetSynthesisJob(panel.PanelRunUUID)
 	require.Error(t, err)
-	h.Poller.postPanelComment(panel, members, storage.PanelOutcomeReviewPosted)
+	h.Poller.postPanelComment(panel, members)
 	assert.Empty(t, *comments)
 	assert.False(t, h.panelPostedAt(t, panel.ID))
 	won, err = h.DB.ClaimPanelForPosting(panel.ID, panelPostingStaleWindow)
@@ -171,7 +174,7 @@ func member(agent, reviewType, status, errText string) storage.BatchReviewResult
 	}
 }
 
-// TestPanelCommitStatus exercises the §9 four-arm switch over member outcomes.
+// TestPanelCommitStatus covers member outcomes when at least one review exists.
 // Status reflects whether the review process ran, never the synthesis verdict:
 // a Fail verdict still posts success; quota/timeout skips are success-with-note.
 func TestPanelCommitStatus(t *testing.T) {
@@ -192,24 +195,6 @@ func TestPanelCommitStatus(t *testing.T) {
 			},
 			wantState: "success",
 			wantDesc:  "Review complete",
-		},
-		{
-			name: "all failed real",
-			members: []storage.BatchReviewResult{
-				member("codex", "review", "failed", "boom"),
-				member("gemini", "security", "failed", "kaboom"),
-			},
-			wantState: "error",
-			wantDesc:  "All reviews failed",
-		},
-		{
-			name: "only skips no real failures is success not failure",
-			members: []storage.BatchReviewResult{
-				member("codex", "review", "failed", quotaErr),
-				member("gemini", "security", "canceled", timeoutErr),
-			},
-			wantState: "success",
-			wantDesc:  "Review complete (2 agent(s) skipped)",
 		},
 		{
 			name: "mixed real failures",
@@ -241,9 +226,10 @@ func TestPanelCommitStatus(t *testing.T) {
 			members: []storage.BatchReviewResult{
 				member("codex", "review", "done", ""),
 				member("gemini", "security", "failed", quotaErr),
+				member("test", "review", "canceled", timeoutErr),
 			},
 			wantState: "success",
-			wantDesc:  "Review complete (1 agent(s) skipped)",
+			wantDesc:  "Review complete (2 agent(s) skipped)",
 		},
 	}
 
@@ -1081,9 +1067,7 @@ func TestPostPanelRunDefersGenuine(t *testing.T) {
 	assert.Equal(1, attempt.ConsecutiveGenuineAttempts, "genuine defer bumps the streak")
 }
 
-// TestPostPanelRunGenuineGiveUp covers the genuine give-up: once the
-// consecutive-genuine streak reaches the cap, the run posts a soft note, sets a
-// blocking status, and finalizes the attempt as done.
+// Once genuine retries are exhausted, finalize with an error and no comment.
 func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -1106,10 +1090,7 @@ func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 
 	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	require.Len(t, *comments, 1, "give-up posts a soft note")
-	assert.Contains((*comments)[0].Body, "## roborev: Review Unavailable", "give-up note header")
-	assert.NotContains((*comments)[0].Body, "private launcher detail")
-	assert.NotContains((*comments)[0].Body, "second diagnostic line")
+	assert.Empty(*comments, "failed reviews do not post PR comments")
 	require.Len(t, *statuses, 1)
 	assert.Equal("error", (*statuses)[0].State, "genuine give-up status blocks required checks")
 	assert.Equal("All reviews failed", (*statuses)[0].Desc)
@@ -1123,13 +1104,10 @@ func TestPostPanelRunGenuineGiveUp(t *testing.T) {
 	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 82, headSHA)
 	require.NoError(t, err)
 	require.NotNil(t, got.Outcome)
-	assert.Equal(storage.PanelOutcomeGiveupPosted, *got.Outcome)
+	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
 }
 
-// TestPostPanelRunTransientGiveUp covers the transient give-up: an all-transient
-// panel whose first attempt is older than the 3-day retry wall stops deferring
-// and posts a non-blocking transient note instead, sets a success (non-failing)
-// status, finalizes the attempt as done, and marks the panel posted (not retired).
+// Exhausted provider retries also finish with an error and no comment.
 func TestPostPanelRunTransientGiveUp(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -1155,24 +1133,14 @@ func TestPostPanelRunTransientGiveUp(t *testing.T) {
 
 	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	require.Len(t, *comments, 1, "transient give-up posts one note after the wall")
-	body := (*comments)[0].Body
-	assert.Contains(body, "## roborev: Review Unavailable", "transient give-up note header")
-	assert.Contains(body, "3 days", "transient note explains the 3-day wall")
-	assert.Contains(body, "provider", "transient note blames the AI provider")
-	assert.NotContains(body, "next commit", "must be the transient note, not the genuine soft note")
-	assert.NotContains(body, "Review Failed", "give-up note is not a terminal Review Failed comment")
-	assert.NotContains(body, "Check CI logs", "give-up note is not a terminal failure comment")
-	assert.NotContains(body, "private provider detail")
-	assert.NotContains(body, "second diagnostic line")
+	assert.Empty(*comments, "exhausted provider retries do not post PR comments")
 
 	require.Len(t, *statuses, 1, "transient give-up sets exactly one status")
-	assert.Equal("success", (*statuses)[0].State, "give-up status is non-failing")
-	assert.NotEqual("failure", (*statuses)[0].State, "give-up status is never failure")
-	assert.NotEqual("error", (*statuses)[0].State, "give-up status is never error")
+	assert.Equal("error", (*statuses)[0].State)
+	assert.Equal("Review unavailable", (*statuses)[0].Desc)
 
 	assert.True(h.panelPostedAt(t, panel.ID), "give-up finalizes the panel (posted_at set)")
-	assert.False(h.panelRetiredAt(t, panel.ID), "give-up posts the panel, it is not retired")
+	assert.False(h.panelRetiredAt(t, panel.ID), "give-up finalizes the panel without scheduling another review")
 
 	attempt, err := h.DB.GetReviewAttempt("acme/api", 85, headSHA)
 	require.NoError(t, err)
@@ -1182,16 +1150,10 @@ func TestPostPanelRunTransientGiveUp(t *testing.T) {
 	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 85, headSHA)
 	require.NoError(t, err)
 	require.NotNil(t, got.Outcome)
-	assert.Equal(storage.PanelOutcomeGiveupPosted, *got.Outcome)
+	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
 }
 
-// TestPostPanelRunAllSkipPersistsNoReviewOutcome covers the all-skip finalize
-// arm: every member is a timeout skip (classifyPanelOutcome falls through to
-// OutcomeAllSkip), so finalizePanelRun still posts the all-skipped summary but
-// must persist storage.PanelOutcomeNoReviewPosted, not the OutcomePost arm's
-// PanelOutcomeReviewPosted — the two arms only differ in which outcome they
-// pass to postPanelComment, so a regression re-merging them would pass every
-// other test in this file.
+// A panel of timeout skips has no review to post or count in review metrics.
 func TestPostPanelRunAllSkipPersistsNoReviewOutcome(t *testing.T) {
 	assert := assert.New(t)
 	h := newCIPollerHarness(t, "https://github.com/acme/api.git")
@@ -1205,15 +1167,107 @@ func TestPostPanelRunAllSkipPersistsNoReviewOutcome(t *testing.T) {
 
 	h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
 
-	require.Len(t, *comments, 1, "all-skip still posts the all-skipped summary")
-	assert.Contains((*comments)[0].Body, "## roborev: Review Skipped", "all-skipped summary header")
-	assert.NotEmpty(*statuses, "commit status set on all-skip")
+	assert.Empty(*comments, "a panel without review output does not post PR comments")
+	require.Len(t, *statuses, 1)
+	assert.Equal("error", (*statuses)[0].State)
 	assert.True(h.panelPostedAt(t, panel.ID), "all-skip finalizes the panel (posted_at set)")
 
 	got, err := h.DB.GetCIPanelByPRSHA("acme/api", 87, "allskip1234567")
 	require.NoError(t, err)
 	require.NotNil(t, got.Outcome)
 	assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome, "all-skip persists the no-review outcome")
+}
+
+func TestPanelWithoutReviewFinalizesAfterStatusError(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			assert := assert.New(t)
+			h := newCIPollerHarness(t, "https://github.com/example/project.git")
+			comments := h.CaptureComments()
+			panel, synth, _ := h.seedCIPanelRun(t, "example/project", 1, "status-error", "base..status-error",
+				[]jobSpec{{Agent: "test", Status: "canceled", Error: reviewpkg.TimeoutErrorPrefix + "expired"}})
+			h.markJobFailed(t, synth.ID, "no usable output")
+			writes := 0
+			h.Poller.setCommitStatusFn = func(_, _, state, _ string) error {
+				writes++
+				assert.Equal("error", state)
+				return &googlegithub.ErrorResponse{
+					Response: &http.Response{StatusCode: status},
+					Message:  "Resource not accessible by integration",
+				}
+			}
+			h.Poller.handleReviewFailed(ciEvent(synth.ID, "review.failed"))
+			h.Poller.reconcilePanelPosting(context.Background(), "example/project")
+			assert.Equal(1, writes, "terminal panels do not retry status writes")
+			assert.True(h.panelPostedAt(t, panel.ID))
+			assert.Empty(*comments)
+			got, err := h.DB.GetCIPanelByRunUUID(panel.PanelRunUUID)
+			require.NoError(t, err)
+			require.NotNil(t, got.Outcome)
+			assert.Equal(storage.PanelOutcomeNoReviewPosted, *got.Outcome)
+			attempt, err := h.DB.GetReviewAttempt("example/project", 1, "status-error")
+			require.NoError(t, err)
+			require.NotNil(t, attempt)
+			assert.Equal("done", attempt.State)
+		})
+	}
+}
+
+func TestPanelWithoutReviewOnlyNotifiesMemberFailures(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		h := newCIPollerHarness(t, "https://github.com/example/project.git")
+		comments := h.CaptureComments()
+		statuses := h.CaptureCommitStatuses()
+		requests := make(chan string, 4)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests <- r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		transport := http.DefaultTransport
+		http.DefaultTransport = server.Client().Transport
+		defer func() { http.DefaultTransport = transport }()
+		h.Cfg.Hooks = []config.HookConfig{{Event: "review.failed", Type: "webhook", URL: server.URL + "/hook"}}
+		h.Cfg.CI.DiscordWebhookURL = server.URL + "/discord"
+		broadcaster := NewBroadcaster()
+		hooks := NewHookRunner(NewStaticConfig(h.Cfg), broadcaster, nil)
+		defer hooks.Stop()
+		subID, events := broadcaster.Subscribe("")
+		defer broadcaster.Unsubscribe(subID)
+		pool := NewWorkerPool(h.DB, NewStaticConfig(h.Cfg), 1, broadcaster, nil, nil)
+
+		panel, _, members := h.seedCIPanelRun(t, "example/project", 1, "no-output", "base..no-output",
+			[]jobSpec{{Agent: "test", Status: "failed", Error: "agent execution failed"}})
+		_, err := h.DB.ReserveReviewAttempt("example/project", 1, "no-output", time.Now())
+		require.NoError(t, err)
+		_, err = h.DB.Exec(`UPDATE ci_pr_review_attempts SET consecutive_genuine_attempts = ?`,
+			reviewpkg.DefaultRetrySchedule.GenuineMax-1)
+		require.NoError(t, err)
+		pool.broadcastFailed(members[0], "test", "agent execution failed")
+		h.Poller.handleReviewFailed(<-events)
+		hooks.WaitUntilIdle()
+		synctest.Wait()
+		require.Len(t, requests, 2)
+		assert.ElementsMatch([]string{"/hook", "/discord"}, []string{<-requests, <-requests})
+
+		require.NoError(t, h.DB.MaybeReleasePanelSynthesis(panel.PanelRunUUID))
+		synth, err := h.DB.ClaimJob(testWorkerID)
+		require.NoError(t, err)
+		require.NotNil(t, synth)
+		require.True(t, synth.IsSynthesisJob())
+		pool.processSynthesisJob(context.Background(), testWorkerID, synth)
+		event := <-events
+		assert.Equal("review.failed", event.Type)
+		assert.Empty(event.Agent, "an uncalled synthesis agent is not blamed")
+		h.Poller.handleReviewFailed(event)
+		hooks.WaitUntilIdle()
+		synctest.Wait()
+		assert.Empty(requests, "the parent does not duplicate member failure alerts")
+		assert.Empty(*comments)
+		require.Len(t, *statuses, 1)
+		assert.Equal("error", (*statuses)[0].State)
+		assert.True(h.panelPostedAt(t, panel.ID), "CI still receives the terminal event")
+	})
 }
 
 // TestFinalizePanelRunBackfillsMissingAttemptRow covers upgrade-boundary panel
