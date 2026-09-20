@@ -75,7 +75,7 @@ jobs:
           mkdir assets
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
             --pattern '*.tar.gz' --pattern '*.zip' \
-            --pattern '*.deb' --pattern '*.rpm' \
+            --pattern '*.deb' --pattern '*.rpm' --pattern '*.json' \
             --pattern 'SHA256SUMS'
 
       - name: Verify required assets are present
@@ -117,7 +117,7 @@ jobs:
           cd assets
           failed=0
           # Every downloaded asset must be listed with a matching hash.
-          for asset in *.tar.gz *.zip *.deb *.rpm; do
+          for asset in *.tar.gz *.zip *.deb *.rpm *.json; do
             [ -e "$asset" ] || continue
             if ! grep " $asset\$" SHA256SUMS | sha256sum -c -; then
               echo "FAIL $asset: checksum mismatch or not listed in SHA256SUMS"
