@@ -47,6 +47,14 @@ type Server struct {
 	configWatcher           *ConfigWatcher
 	broadcaster             Broadcaster
 	workerPool              *WorkerPool
+	search                  reviewSearcher
+	searchReconciler        searchReconciler
+	searchNow               func() time.Time
+	searchMu                sync.Mutex
+	searchCancel            context.CancelFunc
+	searchSubscriberID      int
+	searchWG                sync.WaitGroup
+	searchStopped           bool
 	httpServer              *http.Server
 	browserMu               sync.Mutex
 	browserServer           *http.Server
@@ -179,6 +187,7 @@ func newServerWithLogs(
 		activityLog:        activityLog,
 		releaseNotesClient: releaseNotesClient,
 		releaseNotesNow:    time.Now,
+		searchNow:          time.Now,
 		telemetryStop:      make(chan struct{}),
 		startTime:          time.Now(),
 		shutdownCh:         make(chan struct{}),
@@ -329,20 +338,24 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start worker pool before advertising availability.
 	s.workerPool.Start()
+	s.startSearch(ctx)
 
 	ready, serveExited, err := waitForServerReady(ctx, ep, 2*time.Second, serveErrCh)
 	if err != nil {
 		_ = listener.Close()
 		s.configWatcher.Stop()
 		s.workerPool.Stop()
+		s.stopSearch()
 		return err
 	}
 	if !ready {
 		if err := awaitServeExitOnUnreadyStartup(serveExited, serveErrCh); err != nil {
 			s.configWatcher.Stop()
 			s.workerPool.Stop()
+			s.stopSearch()
 			return err
 		}
+		s.stopSearch()
 		return nil
 	}
 
@@ -391,6 +404,7 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = s.httpServer.Close()
 		s.configWatcher.Stop()
 		s.workerPool.Stop()
+		s.stopSearch()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
@@ -402,6 +416,7 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = s.httpServer.Close()
 		s.configWatcher.Stop()
 		s.workerPool.Stop()
+		s.stopSearch()
 		return nil
 	}
 	s.browserRuntime = browserRuntime
@@ -448,6 +463,7 @@ func (s *Server) Start(ctx context.Context) error {
 		s.configWatcher.Stop()
 		s.stopPanelSweep()
 		s.workerPool.Stop()
+		s.stopSearch()
 		return err
 	}
 	return nil
@@ -643,6 +659,9 @@ func (s *Server) stopOnce0() error {
 
 	// Stop worker pool
 	s.workerPool.Stop()
+
+	// Stop search reconciliation after workers can no longer emit review events.
+	s.stopSearch()
 
 	// Workers cannot emit more completion events. Send the listener poison pill,
 	// drain its FIFO queue, and join any active CI post before teardown continues.
@@ -3634,6 +3653,11 @@ func (s *Server) humaGetHealth(
 		errorCount24h = s.errorLog.Count24h()
 	}
 
+	var searchHealth *storage.SearchHealth
+	if s.searchReconciler != nil {
+		searchHealth = searchHealthFromSnapshot(s.searchReconciler.Health())
+	}
+
 	return &HealthOutput{Body: storage.HealthStatus{
 		Healthy:      allHealthy,
 		Uptime:       uptimeStr,
@@ -3641,6 +3665,7 @@ func (s *Server) humaGetHealth(
 		Components:   components,
 		RecentErrors: recentErrors,
 		ErrorCount:   errorCount24h,
+		Search:       searchHealth,
 	}}, nil
 }
 
