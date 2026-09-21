@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,6 +21,23 @@ type repoSetupResult struct {
 	workingDir string
 	repo       *TestGitRepo
 	extraArgs  []string
+}
+
+func TestNormalizeListFile(t *testing.T) {
+	repoRoot := filepath.Join(t.TempDir(), "repo")
+	for _, tc := range []struct {
+		name string
+		file string
+		want string
+	}{
+		{name: "native separator", file: filepath.Join("pkg", "a.go"), want: "pkg/a.go"},
+		{name: "literal backslash", file: `pkg\a.go`, want: filepath.ToSlash(`pkg\a.go`)},
+		{name: "repo relative from subdirectory", file: "pkg/a.go", want: "pkg/a.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeListFile(repoRoot, tc.file))
+		})
+	}
 }
 
 type listTestCase struct {
@@ -142,6 +160,25 @@ func TestListCommand(t *testing.T) {
 			args:      []string{"--status", "done", "--limit", "10"},
 			handler:   jobsHandler([]storage.ReviewJob{}, false),
 			wantQuery: []string{"status=done", "limit=10"},
+		},
+		{
+			name:      "analysis filters normalize and pass through",
+			args:      []string{"--analysis-type", "refactor", "--file", filepath.Join("pkg", "a.go")},
+			handler:   jobsHandler([]storage.ReviewJob{}, false),
+			wantQuery: []string{"analysis_type=refactor", "analysis_file=pkg%2Fa.go"},
+		},
+		{
+			name: "files column appears for recorded metadata",
+			args: []string{"--all-branches"},
+			handler: jobsHandler([]storage.ReviewJob{{
+				ID:            1,
+				GitRef:        "refactor",
+				RepoName:      "myrepo",
+				Agent:         "test",
+				Status:        storage.JobStatusDone,
+				AnalysisFiles: []string{"pkg/a.go"},
+			}}, false),
+			wantOutput: []string{"Files", "pkg/a.go"},
 		},
 		{
 			name:    "explicit --repo to non-git path sends no branch",

@@ -1466,6 +1466,14 @@ func (s *Server) humaListJobs(
 			listOpts, storage.WithGitRef(input.GitRef),
 		)
 	}
+	if input.AnalysisType != "" {
+		listOpts = append(listOpts, storage.WithAnalysisType(input.AnalysisType))
+	}
+	for _, file := range input.AnalysisFile {
+		if file != "" {
+			listOpts = append(listOpts, storage.WithAnalysisFile(file))
+		}
+	}
 	if input.BranchEmpty == "true" {
 		listOpts = append(listOpts, storage.WithEmptyBranch())
 	} else if input.Branch != "" {
@@ -1578,6 +1586,14 @@ func (s *Server) humaListJobs(
 	var statsOpts []storage.ListJobsOption
 	if input.GitRef != "" {
 		statsOpts = append(statsOpts, storage.WithGitRef(input.GitRef))
+	}
+	if input.AnalysisType != "" {
+		statsOpts = append(statsOpts, storage.WithAnalysisType(input.AnalysisType))
+	}
+	for _, file := range input.AnalysisFile {
+		if file != "" {
+			statsOpts = append(statsOpts, storage.WithAnalysisFile(file))
+		}
 	}
 	if input.BranchEmpty == "true" {
 		statsOpts = append(statsOpts, storage.WithEmptyBranch())
