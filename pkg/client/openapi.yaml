@@ -1556,6 +1556,7 @@ components:
           description: The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
           oneOf:
             - $ref: "#/components/schemas/StructuredReviewDocument"
+            - $ref: "#/components/schemas/LegacyReviewDocument"
             - type: "null"
         duration_ms:
           format: int64
@@ -1601,6 +1602,7 @@ components:
           description: RFC3339 UTC time the review row last changed, including close and reopen. Falls back to completed_at when the row has no recorded update time.
           type: string
         verdict:
+          description: pass, fail, or unknown when a legacy review has no recorded verdict.
           type: string
       required:
         - review_id
@@ -1735,6 +1737,7 @@ components:
           description: The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.
           oneOf:
             - $ref: "#/components/schemas/StructuredReviewDocument"
+            - $ref: "#/components/schemas/LegacyReviewDocument"
             - type: "null"
         duration_ms:
           format: int64
@@ -1760,6 +1763,7 @@ components:
             - string
             - "null"
         verdict:
+          description: pass, fail, or unknown when a legacy review has no recorded verdict.
           type: string
       required:
         - review_id
@@ -1999,6 +2003,43 @@ components:
       required:
         - job
       type: object
+    LegacyReviewDocument:
+      additionalProperties: false
+      description: Historical Markdown without extracted findings.
+      properties:
+        findings:
+          items:
+            $ref: "#/components/schemas/StructuredReviewFinding"
+          maxItems: 0
+          type:
+            - array
+            - "null"
+        legacy:
+          additionalProperties: false
+          description: Historical Markdown without extracted findings. Only present in storage-only schema version 0.
+          properties:
+            markdown:
+              type: string
+            recorded_verdict:
+              type:
+                - boolean
+                - "null"
+          required:
+            - markdown
+            - recorded_verdict
+          type: object
+        schema_version:
+          format: int64
+          maximum: 0
+          minimum: 0
+          type: integer
+        summary:
+          maxLength: 0
+          type: string
+      required:
+        - schema_version
+        - legacy
+      type: object
     ListBranchesOutputBody:
       additionalProperties: false
       properties:
@@ -2091,6 +2132,40 @@ components:
       required:
         - repos
         - total_count
+      type: object
+    MigrateReviewInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/MigrateReviewInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        document: {}
+        review_id:
+          format: int64
+          minimum: 1
+          type: integer
+      required:
+        - review_id
+        - document
+      type: object
+    MigrateReviewOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/MigrateReviewOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        success:
+          type: boolean
+      required:
+        - success
       type: object
     OverviewStats:
       additionalProperties: false
@@ -3488,6 +3563,8 @@ components:
         schema_version:
           description: Version of the document format, separate from the export schema_version.
           format: int64
+          maximum: 2
+          minimum: 1
           type: integer
         source_labels:
           description: Names of the input reviews that findings cite in sources, indexed by review number minus one.
@@ -5253,6 +5330,31 @@ paths:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
       summary: Close or reopen a review
+      tags:
+        - reviews
+  /api/review/migrate:
+    post:
+      operationId: migrate-review
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MigrateReviewInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MigrateReviewOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Replace a legacy review with a validated structured document
       tags:
         - reviews
   /api/search:

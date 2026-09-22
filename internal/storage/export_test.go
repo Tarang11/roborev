@@ -11,9 +11,12 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/roborev/pkg/client/generated"
 	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
@@ -1048,4 +1051,95 @@ func uniqueValues[T comparable](values []T) map[T]struct{} {
 		out[value] = struct{}{}
 	}
 	return out
+}
+
+func TestExportLegacyDocumentSchema(t *testing.T) {
+	env := setupJobEnv(t, t.TempDir(), "legacy-export")
+	fixture := seedLegacyMarkdownReview(t, env.db, env.repo.ID, "prose-export", "Keep the original historical text.", 0, false)
+	require.NoError(t, env.db.migrateLegacyReviews())
+	require.NoError(t, env.db.restoreLegacyReviews())
+	page, err := env.db.ExportReviews(ExportReviewsOptions{Profile: ExportProfileContent})
+	require.NoError(t, err)
+	require.Len(t, page.Reviews, 1)
+	require.NotNil(t, page.Reviews[0].Document)
+	assert.Equal(t, "Keep the original historical text.", page.Reviews[0].Document.Legacy.Markdown)
+	review, err := env.db.GetReviewByJobID(fixture.jobID)
+	require.NoError(t, err)
+	assert.Equal(t, *review.UUID, page.Reviews[0].ReviewID)
+	raw, err := json.Marshal(page.Reviews[0].Document)
+	require.NoError(t, err)
+	registry := huma.NewMapRegistry("#/components/schemas/", huma.DefaultSchemaNamer)
+	schema := (ExportDocument{}).Schema(registry)
+	schemaJSON, err := json.Marshal(schema)
+	require.NoError(t, err)
+	var spec jsonschema.Schema
+	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(schemaJSON), "#/components/schemas/", "#/$defs/")), &spec))
+	definitions, err := json.Marshal(registry.Map())
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal([]byte(strings.ReplaceAll(string(definitions), "#/components/schemas/", "#/$defs/")), &spec.Defs))
+	validator, err := spec.Resolve(nil)
+	require.NoError(t, err)
+
+	for _, wire := range []string{string(raw), `{"schema_version":0,"legacy":{"markdown":"Original text.","recorded_verdict":null}}`} {
+		var value any
+		require.NoError(t, json.Unmarshal([]byte(wire), &value))
+		assert.NoError(t, validator.Validate(value))
+		var decoded generated.ExportReview_Document
+		require.NoError(t, json.Unmarshal([]byte(wire), &decoded))
+		require.NotNil(t, decoded.ExportReview_Document_OneOf)
+		assert.True(t, decoded.ExportReview_Document_OneOf.IsB())
+		require.NoError(t, decoded.Validate())
+		remarshaled, err := json.Marshal(decoded)
+		require.NoError(t, err)
+		var roundTrip any
+		require.NoError(t, json.Unmarshal(remarshaled, &roundTrip))
+		assert.NoError(t, validator.Validate(roundTrip))
+	}
+	var mixed any
+	require.NoError(t, json.Unmarshal([]byte(`{"schema_version":0,"summary":"Invented structured summary","findings":[],"legacy":{"markdown":"Original text.","recorded_verdict":null}}`), &mixed))
+	assert.Error(t, validator.Validate(mixed))
+}
+
+func TestExportReviewsUnknownLegacyVerdict(t *testing.T) {
+	env := setupJobEnv(t, t.TempDir(), "unknown-legacy-export")
+	fixture := seedLegacyMarkdownReview(t, env.db, env.repo.ID, "unknown-review", "Historical prose without a verdict.", nil, false)
+	panelRun := testUUID("legacy-export-panel")
+	member := seedPanelExportJob(t, env.db, env.repo.ID, panelRun, "member", "historical", 0, "codex", "", "2026-06-29 00:00:01", "No issues found.")
+	synthesis := seedPanelExportJob(t, env.db, env.repo.ID, panelRun, "synthesis", "", 0, "codex", "", "2026-06-29 00:00:03", "No issues found.")
+	_, err := env.db.Exec(`UPDATE reviews SET structured_output = NULL, output = 'Historical panel prose.', verdict_bool = NULL WHERE job_id = ?`, member.JobID)
+	require.NoError(t, err)
+	require.NoError(t, env.db.migrateLegacyReviews())
+	require.NoError(t, env.db.restoreLegacyReviews())
+	_, err = env.db.Exec(`UPDATE reviews SET created_at = '2026-06-29 00:00:00' WHERE job_id = ?`, fixture.jobID)
+	require.NoError(t, err)
+
+	for _, profile := range []ExportProfile{ExportProfileContent, ExportProfileMetadata} {
+		t.Run(string(profile), func(t *testing.T) {
+			assert := assert.New(t)
+			page, err := env.db.ExportReviews(ExportReviewsOptions{Profile: profile, Limit: 1})
+			require.NoError(t, err)
+			require.Len(t, page.Reviews, 1)
+			assert.Equal("unknown", page.Reviews[0].Verdict)
+			if profile == ExportProfileContent {
+				assert.Equal("**Unstructured historical review.** Finding counts are unavailable.\n\nHistorical prose without a verdict.", derefString(page.Reviews[0].Content))
+				require.NotNil(t, page.Reviews[0].Document)
+				assert.Nil(page.Reviews[0].Document.Legacy.RecordedVerdict)
+			} else {
+				assert.Nil(page.Reviews[0].Content)
+				assert.Nil(page.Reviews[0].Document)
+			}
+			require.NotNil(t, page.NextCursor)
+			next, err := env.db.ExportReviews(ExportReviewsOptions{Profile: profile, Limit: 1, Cursor: *page.NextCursor})
+			require.NoError(t, err)
+			require.Len(t, next.Reviews, 1)
+			assert.Equal(*synthesis.UUID, next.Reviews[0].ReviewID)
+			require.Len(t, next.Reviews[0].Subagents, 1)
+			sub := next.Reviews[0].Subagents[0]
+			assert.Equal(*member.UUID, sub.ReviewID)
+			assert.Equal("unknown", sub.Verdict)
+			if profile == ExportProfileContent {
+				assert.Equal("**Unstructured historical review.** Finding counts are unavailable.\n\nHistorical panel prose.", derefString(sub.Content))
+			}
+		})
+	}
 }

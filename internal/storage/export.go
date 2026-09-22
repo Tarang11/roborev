@@ -23,13 +23,18 @@ const (
 	ExportProfileContent  ExportProfile = "content"
 	ExportProfileMetadata ExportProfile = "metadata"
 
-	exportCursorVersion     = 1
-	exportDefaultPageLimit  = 500
-	exportMaxPageLimit      = 5000
-	exportReviewStatusDone  = "done"
-	exportReviewVerdictPass = "pass"
-	exportReviewVerdictFail = "fail"
+	exportCursorVersion        = 1
+	exportDefaultPageLimit     = 500
+	exportMaxPageLimit         = 5000
+	exportReviewStatusDone     = "done"
+	exportReviewVerdictPass    = "pass"
+	exportReviewVerdictFail    = "fail"
+	exportReviewVerdictUnknown = "unknown"
 )
+
+// Legacy documents preserve historical reviews even without a recorded verdict.
+// Other results without a verdict keep their existing export exclusion.
+const exportReviewHasVerdictExpr = "(rv.verdict_bool IS NOT NULL OR json_extract(rv.structured_output, '$.schema_version') = 0)"
 
 // exportReviewUpdatedAtExpr is the review's update time with the created_at
 // fallback for rows that predate updated_at or carry an empty value.
@@ -63,7 +68,7 @@ type ExportReviewsPage struct {
 type ExportReview struct {
 	ReviewID            uuid.UUID              `json:"review_id" format:"uuid"`
 	Status              string                 `json:"status"`
-	Verdict             string                 `json:"verdict"`
+	Verdict             string                 `json:"verdict" doc:"pass, fail, or unknown when a legacy review has no recorded verdict."`
 	CreatedAt           string                 `json:"created_at"`
 	CompletedAt         string                 `json:"completed_at"`
 	DurationMS          *int64                 `json:"duration_ms"`
@@ -91,7 +96,7 @@ type ExportSubagent struct {
 	Agent               string           `json:"agent"`
 	Model               *string          `json:"model"`
 	ReviewType          *string          `json:"review_type"`
-	Verdict             string           `json:"verdict"`
+	Verdict             string           `json:"verdict" doc:"pass, fail, or unknown when a legacy review has no recorded verdict."`
 	CompletedAt         string           `json:"completed_at"`
 	DurationMS          *int64           `json:"duration_ms"`
 	Cost                ExportReviewCost `json:"cost"`
@@ -148,7 +153,7 @@ func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
 		Description:          "The canonical JSON review document. The Go package go.kenn.io/roborev/pkg/structuredreview decodes and renders it.",
 		AdditionalProperties: false,
 		Properties: map[string]*huma.Schema{
-			"schema_version": {Type: huma.TypeInteger, Format: "int64", Description: "Version of the document format, separate from the export schema_version."},
+			"schema_version": {Type: huma.TypeInteger, Format: "int64", Minimum: new(float64(1)), Maximum: new(float64(2)), Description: "Version of the document format, separate from the export schema_version."},
 			"summary":        {Type: huma.TypeString},
 			"verdict": {
 				Type:        huma.TypeString,
@@ -166,10 +171,27 @@ func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
 		},
 		Required: []string{"schema_version", "summary", "findings"},
 	}
+	schemas["LegacyReviewDocument"] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "Historical Markdown without extracted findings.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"schema_version": {Type: huma.TypeInteger, Format: "int64", Minimum: new(float64(0)), Maximum: new(float64(0))},
+			"summary":        {Type: huma.TypeString, MaxLength: new(0)},
+			"findings":       {Type: huma.TypeArray, Nullable: true, MaxItems: new(0), Items: &huma.Schema{Ref: refPrefix + exportFindingSchemaName}},
+			"legacy": {Type: huma.TypeObject, AdditionalProperties: false, Description: "Historical Markdown without extracted findings. Only present in storage-only schema version 0.", Properties: map[string]*huma.Schema{
+				"markdown":         {Type: huma.TypeString},
+				"recorded_verdict": {Type: huma.TypeBoolean, Nullable: true},
+			}, Required: []string{"markdown", "recorded_verdict"}},
+		},
+		Required: []string{"schema_version", "legacy"},
+	}
+
 	return &huma.Schema{
 		Description: "The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.",
 		OneOf: []*huma.Schema{
 			{Ref: refPrefix + exportDocumentSchemaName},
+			{Ref: refPrefix + "LegacyReviewDocument"},
 			{Type: "null"},
 		},
 	}
@@ -191,7 +213,7 @@ type exportCursor struct {
 type exportReviewRow struct {
 	reviewID            uuid.UUID
 	jobUUID             uuid.UUID
-	verdictBool         int64
+	verdictBool         sql.NullInt64
 	reviewCreated       string
 	closed              bool
 	reviewUpdated       sql.NullString
@@ -298,7 +320,7 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 		"j.status = 'done'",
 		"COALESCE(j.job_type, 'review') IN ('review','range','dirty','synthesis')",
 		"COALESCE(j.panel_role, '') != 'member'",
-		"rv.verdict_bool IS NOT NULL",
+		exportReviewHasVerdictExpr,
 	)
 	if !opts.Since.IsZero() {
 		conditions = append(conditions, completedExpr+" >= datetime(?)")
@@ -480,7 +502,7 @@ func (db *DB) exportSubagents(panelRunUUID uuid.UUID, profile ExportProfile) ([]
 		WHERE j.panel_run_uuid = ?
 		  AND j.panel_role = 'member'
 		  AND j.status = 'done'
-		  AND rv.verdict_bool IS NOT NULL
+		  AND `+exportReviewHasVerdictExpr+`
 		ORDER BY j.panel_member_index ASC, j.id ASC
 	`, panelRunUUID)
 	if err != nil {
@@ -491,7 +513,7 @@ func (db *DB) exportSubagents(panelRunUUID uuid.UUID, profile ExportProfile) ([]
 	out := []ExportSubagent{}
 	for rows.Next() {
 		var reviewID uuid.UUID
-		var verdictBool int64
+		var verdictBool sql.NullInt64
 		var completedAt string
 		var output sql.NullString
 		var agentName string
@@ -619,8 +641,11 @@ func formatExportTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func exportVerdict(verdictBool int64) string {
-	if verdictBool == 1 {
+func exportVerdict(verdictBool sql.NullInt64) string {
+	if !verdictBool.Valid {
+		return exportReviewVerdictUnknown
+	}
+	if verdictBool.Int64 == 1 {
 		return exportReviewVerdictPass
 	}
 	return exportReviewVerdictFail
@@ -751,7 +776,7 @@ func (db *DB) exportCursorReviewExists(cursor *exportCursor) (bool, error) {
 		  AND j.status = 'done'
 		  AND COALESCE(j.job_type, 'review') IN ('review','range','dirty','synthesis')
 		  AND COALESCE(j.panel_role, '') != 'member'
-		  AND rv.verdict_bool IS NOT NULL
+		  AND `+exportReviewHasVerdictExpr+`
 	`, cursor.ReviewID, cursor.CompletedAt).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("validate export cursor: %w", err)
