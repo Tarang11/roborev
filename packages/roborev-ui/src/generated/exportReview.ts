@@ -4,11 +4,14 @@
 import type { ExperimentAssignment } from "./experimentAssignment";
 import type { ExportReviewCost } from "./exportReviewCost";
 import type { ExportSubagent } from "./exportSubagent";
+import type { StructuredReviewDocument } from "./structuredReviewDocument";
 
 export interface ExportReview {
   agent: string;
   /** @nullable */
   branch: string | null;
+  /** True when the review is marked closed. */
+  closed: boolean;
   /** @nullable */
   commit_sha: string | null;
   completed_at: string;
@@ -16,6 +19,8 @@ export interface ExportReview {
   content: string | null;
   cost: ExportReviewCost;
   created_at: string;
+  /** The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document. */
+  document: StructuredReviewDocument | null;
   /** @nullable */
   duration_ms: number | null;
   experiments: ExperimentAssignment[];
@@ -32,5 +37,7 @@ export interface ExportReview {
   review_id: string;
   status: string;
   subagents: ExportSubagent[];
+  /** RFC3339 UTC time the review row last changed, including close and reopen. Falls back to completed_at when the row has no recorded update time. */
+  updated_at: string;
   verdict: string;
 }

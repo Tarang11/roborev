@@ -12,7 +12,9 @@ import (
 	"time"
 	"uuid"
 
-	"go.kenn.io/roborev/internal/structuredreview"
+	"github.com/danielgtaylor/huma/v2"
+
+	"go.kenn.io/roborev/pkg/structuredreview"
 )
 
 type ExportProfile string
@@ -29,6 +31,10 @@ const (
 	exportReviewVerdictFail = "fail"
 )
 
+// exportReviewUpdatedAtExpr is the review's update time with the created_at
+// fallback for rows that predate updated_at or carry an empty value.
+const exportReviewUpdatedAtExpr = "COALESCE(NULLIF(TRIM(rv.updated_at), ''), rv.created_at)"
+
 var (
 	ErrExportCursorDatabaseMismatch = errors.New("export cursor database reset")
 	ErrExportCursorNotFound         = errors.New("export cursor no longer resolvable")
@@ -40,9 +46,12 @@ type ExportReviewsOptions struct {
 	Until      time.Time
 	Cursor     string
 	ClosedOnly bool
-	Repo       string
-	Project    string
-	Limit      int
+	// UpdatedSince is an inclusive lower bound on the review's updated_at. It
+	// is a filter, not a window: ordering and the cursor stay on completed_at.
+	UpdatedSince time.Time
+	Repo         string
+	Project      string
+	Limit        int
 }
 
 type ExportReviewsPage struct {
@@ -68,6 +77,9 @@ type ExportReview struct {
 	Model               *string                `json:"model"`
 	Cost                ExportReviewCost       `json:"cost"`
 	Content             *string                `json:"content"`
+	Document            *ExportDocument        `json:"document"`
+	Closed              bool                   `json:"closed" doc:"True when the review is marked closed."`
+	UpdatedAt           string                 `json:"updated_at" doc:"RFC3339 UTC time the review row last changed, including close and reopen. Falls back to completed_at when the row has no recorded update time."`
 	Subagents           []ExportSubagent       `json:"subagents"`
 	Experiments         []ExperimentAssignment `json:"experiments"`
 	ResumeSourceJobUUID *uuid.UUID             `json:"resume_source_job_uuid" format:"uuid" nullable:"true"`
@@ -84,7 +96,83 @@ type ExportSubagent struct {
 	DurationMS          *int64           `json:"duration_ms"`
 	Cost                ExportReviewCost `json:"cost"`
 	Content             *string          `json:"content"`
+	Document            *ExportDocument  `json:"document"`
 	ResumeSourceJobUUID *uuid.UUID       `json:"resume_source_job_uuid" format:"uuid" nullable:"true"`
+}
+
+// ExportDocument is a stored structured review document as the export emits
+// it. It always holds a document that passed structuredreview.Decode, and it
+// encodes as that document's canonical JSON rather than the stored bytes.
+type ExportDocument struct {
+	structuredreview.Document
+}
+
+func (d ExportDocument) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.Document)
+}
+
+const (
+	exportDocumentSchemaName = "StructuredReviewDocument"
+	exportFindingSchemaName  = "StructuredReviewFinding"
+)
+
+// Schema describes the document as it appears on the wire. Reflection cannot
+// derive it: a finding's location is always present and null when empty, and
+// the export field itself is null when a review has no stored document.
+//
+// Severity and verdict are described in prose rather than as enums. The Go
+// client generator names enum constants by value alone, so a second "pass"
+// or "fail" enum renames the constants of the existing one and breaks callers.
+func (ExportDocument) Schema(r huma.Registry) *huma.Schema {
+	const refPrefix = "#/components/schemas/"
+	schemas := r.Map()
+	schemas[exportFindingSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "One finding in a structured review document.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"severity": {Type: huma.TypeString, Description: "One of critical, high, medium, or low."},
+			"problem":  {Type: huma.TypeString},
+			"fix":      {Type: huma.TypeString},
+			"location": {Type: huma.TypeString, Nullable: true, Description: "Where the problem is, or null when the finding has no location."},
+			"sources": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Type: huma.TypeInteger, Format: "int64"},
+				Description: "1-based numbers of the input reviews that reported this finding. Present on synthesized documents.",
+			},
+		},
+		Required: []string{"severity", "problem", "fix", "location"},
+	}
+	schemas[exportDocumentSchemaName] = &huma.Schema{
+		Type:                 huma.TypeObject,
+		Description:          "The canonical JSON review document. The Go package go.kenn.io/roborev/pkg/structuredreview decodes and renders it.",
+		AdditionalProperties: false,
+		Properties: map[string]*huma.Schema{
+			"schema_version": {Type: huma.TypeInteger, Format: "int64", Description: "Version of the document format, separate from the export schema_version."},
+			"summary":        {Type: huma.TypeString},
+			"verdict": {
+				Type:        huma.TypeString,
+				Description: "The agent's own assessment: pass, fail, or unable_to_review. Omitted by version 1 documents.",
+			},
+			"findings": {
+				Type:  huma.TypeArray,
+				Items: &huma.Schema{Ref: refPrefix + exportFindingSchemaName},
+			},
+			"source_labels": {
+				Type:        huma.TypeArray,
+				Items:       &huma.Schema{Type: huma.TypeString},
+				Description: "Names of the input reviews that findings cite in sources, indexed by review number minus one.",
+			},
+		},
+		Required: []string{"schema_version", "summary", "findings"},
+	}
+	return &huma.Schema{
+		Description: "The stored review document in canonical JSON. Null in the metadata profile and for reviews stored without a document. content is the Markdown rendering of this document.",
+		OneOf: []*huma.Schema{
+			{Ref: refPrefix + exportDocumentSchemaName},
+			{Type: "null"},
+		},
+	}
 }
 
 type ExportReviewCost struct {
@@ -105,6 +193,9 @@ type exportReviewRow struct {
 	jobUUID             uuid.UUID
 	verdictBool         int64
 	reviewCreated       string
+	closed              bool
+	reviewUpdated       sql.NullString
+	document            *ExportDocument
 	output              sql.NullString
 	status              string
 	enqueuedAt          string
@@ -220,6 +311,10 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 	if opts.ClosedOnly {
 		conditions = append(conditions, "rv.closed = 1")
 	}
+	if !opts.UpdatedSince.IsZero() {
+		conditions = append(conditions, sqliteNormalizedTimestampExpr(exportReviewUpdatedAtExpr)+" >= datetime(?)")
+		args = append(args, opts.UpdatedSince.UTC().Format(time.RFC3339))
+	}
 	if opts.Repo != "" {
 		conditions = append(conditions, "COALESCE(NULLIF(TRIM(rp.identity), ''), rp.name) = ?")
 		args = append(args, opts.Repo)
@@ -240,7 +335,8 @@ func (db *DB) queryExportReviewRows(opts ExportReviewsOptions, cursor *exportCur
 	}
 
 	query := `
-		SELECT rv.uuid, j.uuid, rv.verdict_bool, rv.created_at, ` + outputExpr + `,
+		SELECT rv.uuid, j.uuid, rv.verdict_bool, rv.created_at,
+		       COALESCE(rv.closed, 0), rv.updated_at, ` + outputExpr + `,
 		       j.status, j.enqueued_at, j.started_at, j.finished_at, j.agent, j.model,
 		       j.git_ref, COALESCE(j.job_type, 'review'), j.branch, j.ci_base_branch,
 		       j.panel_run_uuid, j.panel_role, j.token_usage,
@@ -263,6 +359,8 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 		&row.jobUUID,
 		&row.verdictBool,
 		&row.reviewCreated,
+		&row.closed,
+		&row.reviewUpdated,
 		&row.output,
 		&row.status,
 		&row.enqueuedAt,
@@ -291,6 +389,7 @@ func scanExportReviewRow(rows *sql.Rows) (exportReviewRow, error) {
 			return row, decodeErr
 		}
 		row.output.String = doc.Markdown("")
+		row.document = &ExportDocument{Document: doc}
 	}
 
 	return row, err
@@ -308,6 +407,8 @@ func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
 		Verdict:             exportVerdict(row.verdictBool),
 		CreatedAt:           formatExportTime(parseSQLiteTime(row.enqueuedAt)),
 		CompletedAt:         formatExportTime(completed),
+		Closed:              row.closed,
+		UpdatedAt:           formatExportTime(row.exportUpdatedAt(completed)),
 		DurationMS:          exportDurationMS(row.startedAt, row.finishedAt),
 		Project:             row.project,
 		Repo:                repo,
@@ -329,8 +430,21 @@ func (row exportReviewRow) toExportReview(profile ExportProfile) ExportReview {
 	}
 	if profile == ExportProfileContent && row.output.Valid {
 		review.Content = new(row.output.String)
+		review.Document = row.document
 	}
 	return review
+}
+
+// exportUpdatedAt returns the review's updated_at, falling back to its
+// completion time when the row has no usable update time. The SQL filter in
+// exportReviewUpdatedAtExpr applies the same fallback.
+func (row exportReviewRow) exportUpdatedAt(completed time.Time) time.Time {
+	if row.reviewUpdated.Valid {
+		if updated := parseSQLiteTime(strings.TrimSpace(row.reviewUpdated.String)); !updated.IsZero() {
+			return updated
+		}
+	}
+	return completed
 }
 
 func (row exportReviewRow) exportCommitSHA() string {
@@ -417,6 +531,7 @@ func (db *DB) exportSubagents(panelRunUUID uuid.UUID, profile ExportProfile) ([]
 				return nil, err
 			}
 			sub.Content = new(doc.Markdown(""))
+			sub.Document = &ExportDocument{Document: doc}
 		}
 		out = append(out, sub)
 	}

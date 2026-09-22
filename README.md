@@ -251,8 +251,10 @@ roborev export reviews --closed-only --repo github.com/org/repo --limit 1000
 roborev export reviews --cursor "$NEXT_CURSOR" --until 2026-07-01
 ```
 
-The default `content` profile includes raw review output as stored. That output
-may contain sensitive repository details, so handle exported files carefully.
+The default `content` profile includes each review twice: `document` is the
+stored JSON review document with the summary, verdict, and findings, and
+`content` is the Markdown rendering of it. Review text may contain sensitive
+repository details, so handle exported files carefully.
 Use `--profile metadata` when you only need identifiers, timestamps, verdicts,
 cost metadata, and related review metadata.
 
@@ -263,6 +265,12 @@ be combined with `--since`. If a cursor belongs to a previous database
 generation, `roborev export reviews` exits with code `3`; discard the cursor
 and retry with a window backfill. Other cursor rejections also require
 discarding the cursor before backfilling.
+
+Each exported review reports `closed` and `updated_at`. Closing or reopening a
+review does not move it past a `completed_at` cursor, so combine the cursor pull
+with `roborev export reviews --updated-since <time>` to pick up later close and
+reopen changes. See the
+[export reference](https://roborev.io/docs/commands/#exporting-reviews).
 
 Use `roborev export ci-metrics` to emit finalized CI panel runs — terminal
 outcome (`review_posted`, `no_review_posted`, `giveup_posted`, `abandoned`,
