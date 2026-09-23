@@ -274,7 +274,7 @@ func waitForSyncWorkerConnection(worker *SyncWorker, timeout time.Duration) erro
 		if err.Error() != "not connected to PostgreSQL" {
 			return err
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond) //nolint:kennlint // waits for the sync worker to reach PostgreSQL
 	}
 	return fmt.Errorf("timeout waiting for sync worker connection")
 }
@@ -322,7 +322,7 @@ func startSyncWorkerNoSync(
 		if healthy {
 			return worker
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) //nolint:kennlint // waits for the sync worker to reach PostgreSQL
 	}
 	require.Condition(t, func() bool {
 		return false
@@ -359,7 +359,7 @@ func waitCondition(t *testing.T, timeout time.Duration, msg string, condition fu
 		if ok {
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) //nolint:kennlint // polls state that syncs through PostgreSQL
 	}
 	if lastErr != nil {
 		require.Condition(t, func() bool {
@@ -1307,9 +1307,10 @@ func TestIntegration_MultiplayerSameCommit(t *testing.T) {
 	t.Log("Same-commit multiplayer verified: both reviews preserved with unique UUIDs")
 }
 
-func runConcurrentReviewsAndSync(db *DB, repoID int64, worker *SyncWorker, prefix, author string, count int, results chan<- uuid.UUID, errs chan<- error, done chan<- bool) {
+func runConcurrentReviewsAndSync(start <-chan struct{}, db *DB, repoID int64, worker *SyncWorker, prefix, author string, count int, results chan<- uuid.UUID, errs chan<- error, done chan<- bool) {
 	go func() {
 		defer func() { done <- true }()
+		<-start
 		for i := range count {
 			job, _, err := tryCreateCompletedReview(db, repoID, fmt.Sprintf("%s_%02d", prefix, i), author, fmt.Sprintf("%s concurrent %d", author, i), "prompt", fmt.Sprintf("Review %s-%d", prefix, i))
 			if err != nil {
@@ -1322,7 +1323,6 @@ func runConcurrentReviewsAndSync(db *DB, repoID int64, worker *SyncWorker, prefi
 					errs <- fmt.Errorf("%s sync at job %d: %w", author, i, err)
 				}
 			}
-			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 }
@@ -1415,10 +1415,13 @@ func TestIntegration_MultiplayerRealistic(t *testing.T) {
 		syncErrsB := make(chan error, 4)
 		syncErrsC := make(chan error, 4)
 		done := make(chan bool, 3)
+		start := make(chan struct{})
 
-		runConcurrentReviewsAndSync(dbA, repoA.ID, workerA, "a3", "Alice", 10, jobResultsA, syncErrsA, done)
-		runConcurrentReviewsAndSync(dbB, repoB.ID, workerB, "b3", "Bob", 10, jobResultsB, syncErrsB, done)
-		runConcurrentReviewsAndSync(dbC, repoC.ID, workerC, "c3", "Carol", 10, jobResultsC, syncErrsC, done)
+		runConcurrentReviewsAndSync(start, dbA, repoA.ID, workerA, "a3", "Alice", 10, jobResultsA, syncErrsA, done)
+		runConcurrentReviewsAndSync(start, dbB, repoB.ID, workerB, "b3", "Bob", 10, jobResultsB, syncErrsB, done)
+		runConcurrentReviewsAndSync(start, dbC, repoC.ID, workerC, "c3", "Carol", 10, jobResultsC, syncErrsC, done)
+		// Release all machines together so their writes and syncs overlap.
+		close(start)
 
 		<-done
 		<-done
