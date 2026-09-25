@@ -197,7 +197,7 @@ type model struct {
 
 	// Active filter (applied to queue view)
 	activeRepoFilter   []string // Empty = show all, otherwise repo root_paths to filter by
-	autoRepoFilter     bool     // true when activeRepoFilter came from auto_filter_repo
+	autoRepoFilter     bool     // true when activeRepoFilter came from [tui] filter_repo
 	activeBranchFilter string   // Empty = show all, otherwise branch name to filter by
 	filterStack        []string // Order of applied filters: "repo", "branch" - for escape to pop in order
 	hideClosed         bool     // When true, hide jobs with closed reviews
@@ -784,8 +784,7 @@ func newModel(ep daemon.DaemonEndpoint, opts ...option) model {
 
 	daemonVersion := "?"
 	hideClosed := false
-	autoFilterRepo := false
-	autoFilterBranch := false
+	var autoFilterRepoCfg, autoFilterBranchCfg *bool
 	mouseEnabled := true
 	tabWidth := 2
 	columnBorders := false
@@ -806,8 +805,8 @@ func newModel(ep daemon.DaemonEndpoint, opts ...option) model {
 		if cfg, err := config.LoadGlobal(); err == nil {
 			globalCfg = cfg
 			hideClosed = cfg.HideClosedByDefault
-			autoFilterRepo = cfg.AutoFilterRepo
-			autoFilterBranch = cfg.AutoFilterBranch
+			autoFilterRepoCfg = cfg.TUI.FilterRepo
+			autoFilterBranchCfg = cfg.TUI.FilterBranch
 			mouseEnabled = cfg.MouseEnabled
 			if cfg.TabWidth > 0 {
 				tabWidth = cfg.TabWidth
@@ -836,6 +835,16 @@ func newModel(ep daemon.DaemonEndpoint, opts ...option) model {
 		sseStop = make(chan struct{})
 		go startSSESubscription(ep, sseCh, sseStop)
 	}
+
+	// Test override for launching from a detected checkout
+	if opt.cwdWorktreePath != "" {
+		cwdRepoRoot = opt.cwdRepoRoot
+		cwdWorktreePath = opt.cwdWorktreePath
+		cwdBranch = opt.cwdBranch
+	}
+	// Unset [tui] filter settings default to on.
+	autoFilterRepo := autoFilterRepoCfg == nil || *autoFilterRepoCfg
+	autoFilterBranch := autoFilterBranchCfg == nil || *autoFilterBranchCfg
 
 	// Test overrides for auto-filter simulation
 	if opt.autoFilterRepo {

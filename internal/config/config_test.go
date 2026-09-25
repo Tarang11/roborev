@@ -195,11 +195,11 @@ func TestCostConfigResolvedTimeoutFallsBackToDefault(t *testing.T) {
 	}
 }
 
-func TestSaveAndLoadGlobalAutoFilterBranch(t *testing.T) {
+func TestSaveAndLoadGlobalTUIFilterBranch(t *testing.T) {
 	testenv.SetDataDir(t)
 
 	cfg := DefaultConfig()
-	cfg.AutoFilterBranch = true
+	cfg.TUI.FilterBranch = new(true)
 	{
 
 		err := SaveGlobal(cfg)
@@ -212,16 +212,14 @@ func TestSaveAndLoadGlobalAutoFilterBranch(t *testing.T) {
 	require.Condition(t, func() bool {
 		return err == nil
 	}, "LoadGlobal failed: %v", err)
-	assert.Condition(t, func() bool {
-		return loaded.AutoFilterBranch
-	}, "AutoFilterBranch should be true after round-trip")
+	assert.Equal(t, new(true), loaded.TUI.FilterBranch)
 }
 
-func TestLoadGlobalAutoFilterBranchFromTOML(t *testing.T) {
+func TestLoadGlobalTUIFilterBranchFromTOML(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
 	{
-		err := os.WriteFile(path, []byte("auto_filter_branch = true\n"), 0o644)
+		err := os.WriteFile(path, []byte("[tui]\nfilter_branch = true\n"), 0o644)
 		require.Condition(t, func() bool {
 			return err == nil
 		}, "write config: %v", err)
@@ -231,9 +229,26 @@ func TestLoadGlobalAutoFilterBranchFromTOML(t *testing.T) {
 	require.Condition(t, func() bool {
 		return err == nil
 	}, "LoadGlobalFrom failed: %v", err)
-	assert.Condition(t, func() bool {
-		return cfg.AutoFilterBranch
-	}, "AutoFilterBranch should be true when loaded from TOML")
+	assert.Equal(t, new(true), cfg.TUI.FilterBranch)
+}
+
+func TestLoadGlobalIgnoresLegacyAutoFilterKeys(t *testing.T) {
+	assert := assert.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	legacy := "auto_filter_repo = false\nauto_filter_branch = false\n"
+	require.NoError(t, os.WriteFile(path, []byte(legacy), 0o644))
+
+	cfg, err := LoadGlobalFrom(path)
+	require.NoError(t, err)
+	assert.Nil(cfg.TUI.FilterRepo)
+	assert.Nil(cfg.TUI.FilterBranch)
+
+	require.NoError(t, SaveGlobalTo(path, cfg))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(string(data), "auto_filter_")
+	assert.NotContains(string(data), "filter_repo")
+	assert.NotContains(string(data), "filter_branch")
 }
 
 func TestSaveAndLoadGlobalMouseEnabled(t *testing.T) {

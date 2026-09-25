@@ -529,7 +529,7 @@ func withExternalIODisabled() option {
 	return func(o *options) { o.disableExternalIO = true }
 }
 
-// withAutoFilterBranch simulates auto_filter_branch config in tests.
+// withAutoFilterBranch simulates [tui] filter_branch config in tests.
 func withAutoFilterBranch(branch string) option {
 	return func(o *options) {
 		o.autoFilterBranch = true
@@ -537,11 +537,21 @@ func withAutoFilterBranch(branch string) option {
 	}
 }
 
-// withAutoFilterRepo simulates auto_filter_repo config in tests.
+// withAutoFilterRepo simulates [tui] filter_repo config in tests.
 func withAutoFilterRepo(repo string) option {
 	return func(o *options) {
 		o.autoFilterRepo = true
 		o.cwdRepoRoot = repo
+	}
+}
+
+// withCwdCheckout simulates launching from a checkout with no
+// [tui] filter config set.
+func withCwdCheckout(repoRoot, worktreePath, branch string) option {
+	return func(o *options) {
+		o.cwdRepoRoot = repoRoot
+		o.cwdWorktreePath = worktreePath
+		o.cwdBranch = branch
 	}
 }
 
@@ -556,10 +566,11 @@ type options struct {
 	branchFilter      string // --branch flag: lock filter to this branch
 	noQuit            bool   // --no-quit flag: suppress keyboard quit
 	disableExternalIO bool   // tests: disable daemon/config/git calls
-	autoFilterRepo    bool   // tests: simulate auto_filter_repo config
-	autoFilterBranch  bool   // tests: simulate auto_filter_branch config
+	autoFilterRepo    bool   // tests: simulate [tui] filter_repo config
+	autoFilterBranch  bool   // tests: simulate [tui] filter_branch config
 	cwdRepoRoot       string // tests: simulate detected repo root
 	cwdRepoIdentity   string // tests: simulate detected repo identity
+	cwdWorktreePath   string // tests: simulate detected worktree path
 	cwdBranch         string // tests: simulate detected branch
 }
 
